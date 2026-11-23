@@ -4,9 +4,11 @@ import asyncio
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 
 from openjev_server.profile import Profile
 from openjev_server.readout import Readout
+from openjev_server.server import build_app
 
 STATES = [
     "Customer message: I was charged twice for my order last week and nobody has replied.",
@@ -49,6 +51,20 @@ def test_prompts_equal_released_helper(shim, fake_backend):
     shim._seen_prompts.clear()
     shim_answers(shim, STATES[1], {"route": QUESTIONS["route"], "urgency": QUESTIONS["urgency"]})
     assert sorted(map(json.dumps, fake_backend.prompts)) == sorted(map(json.dumps, shim._seen_prompts))
+
+
+def test_http_requests_send_the_released_helpers_prompts(shim, fake_backend):
+    """Requests the server accepted before 0.3.0, sent over HTTP as plain or ASCII-escaped JSON: the model sees the released helper's
+    prompts, byte for byte."""
+    c = TestClient(build_app(Readout(fake_backend, Profile())))
+    for state in [*STATES, "Message reçu : facturé deux fois, 3 € 😡"]:
+        body = {"model": "x", "state": state, "questions": QUESTIONS}
+        shim._seen_prompts.clear()
+        shim_answers(shim, state, QUESTIONS)
+        for raw in (json.dumps(body).encode(), json.dumps(body, ensure_ascii=False).encode()):
+            fake_backend.prompts.clear()
+            assert c.post("/v1/systemone", content=raw, headers={"Content-Type": "application/json"}).status_code == 200
+            assert sorted(map(json.dumps, fake_backend.prompts)) == sorted(map(json.dumps, shim._seen_prompts))
 
 
 def test_perms_average_matches(shim, fake_backend, monkeypatch):
