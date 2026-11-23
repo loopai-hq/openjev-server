@@ -9,6 +9,7 @@ import pytest
 import zstandard
 from fastapi.testclient import TestClient
 
+from openjev_server import body
 from openjev_server.backends.base import BackendError
 from openjev_server.profile import Profile
 from openjev_server.readout import Readout
@@ -62,6 +63,14 @@ def sized(n):
     return head + b"a" * (n - len(head) - len(tail)) + tail
 
 
+def zstd_frame(content, window_log):
+    """A zstd frame written by hand: no content size, so the decoder must reserve the window the frame declares (2**window_log
+    bytes), then the content as one raw block."""
+    descriptor = (window_log - 10) << 3  # Window_Descriptor: exponent, mantissa 0
+    block = (len(content) << 3 | 1).to_bytes(3, "little")  # Block_Header: a raw block, the last one
+    return b"\x28\xb5\x2f\xfd" + b"\x00" + bytes([descriptor]) + block + content
+
+
 @pytest.mark.parametrize("encoding", ["gzip", "x-gzip", "zstd"])
 def test_compressed_bodies_send_the_same_prompts(fake_backend, encoding):
     c = api(fake_backend)
@@ -78,14 +87,17 @@ def test_compressed_bodies_send_the_same_prompts(fake_backend, encoding):
     ("raw", "headers", "status", "says"),
     [
         (b'{"state": ', {}, 400, "malformed JSON"),
+        (b'{"state": ' + b"[" * 100_000 + b"]" * 100_000 + b"}", {}, 400, "malformed JSON"),
         (b"[1, 2]", {}, 400, "JSON object"),
         (b"not gzip", {"Content-Encoding": "gzip"}, 400, "malformed gzip"),
+        (gzip.compress(json.dumps(REQ).encode())[:-8], {"Content-Encoding": "gzip"}, 400, "truncated"),
+        (gzip.compress(json.dumps(REQ).encode()) + gzip.compress(b""), {"Content-Encoding": "gzip"}, 400, "one gzip member"),
         (b"not zstd", {"Content-Encoding": "zstd"}, 400, "malformed zstd"),
         (json.dumps(REQ).encode(), {"Content-Encoding": "br"}, 415, "unsupported"),
         (sized(MIB32 + 1), {}, 413, "32 MiB"),
         (gzip.compress(sized(MIB32 + 1)), {"Content-Encoding": "gzip"}, 413, "32 MiB"),
     ],
-    ids=["json", "not-object", "gzip", "zstd", "encoding", "size", "size-inflated"],
+    ids=["json", "nested", "not-object", "gzip", "gzip-truncated", "gzip-members", "zstd", "encoding", "size", "size-inflated"],
 )
 def test_unreadable_bodies_are_json_errors(fake_backend, raw, headers, status, says):
     r = post(api(fake_backend), raw, **headers)
@@ -98,6 +110,23 @@ def test_a_body_of_exactly_32_mib_is_read(fake_backend, encoding):
     raw = sized(MIB32)
     r = post(api(fake_backend), gzip.compress(raw) if encoding == "gzip" else raw, **{"Content-Encoding": encoding})
     assert r.status_code == 200 and "a" * (MIB32 - 100) in fake_backend.prompts[0]
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "zstd"])
+def test_bodies_that_inflate_past_the_limit_are_413(fake_backend, monkeypatch, encoding):
+    """A few KiB that inflate to one byte past the limit (lowered here to 4 MiB) are a 413."""
+    monkeypatch.setattr(body, "MAX_BODY", 4 * 1024 * 1024)
+    raw = sized(4 * 1024 * 1024 + 1)
+    packed = zstandard.ZstdCompressor().compress(raw) if encoding == "zstd" else gzip.compress(raw)
+    r = post(api(fake_backend), packed, **{"Content-Encoding": encoding})
+    assert len(packed) < 64 * 1024 and r.status_code == 413 and r.json()["detail"] == "the body is over 4 MiB after decompression"
+
+
+@pytest.mark.parametrize(("window_log", "status"), [(25, 200), (26, 400)])
+def test_a_zstd_window_above_the_limit_is_400(fake_backend, window_log, status):
+    """A frame of a few bytes may declare any window: up to the 32 MiB limit (2**25) it is read, above it the frame is refused."""
+    r = post(api(fake_backend), zstd_frame(json.dumps(REQ).encode(), window_log), **{"Content-Encoding": "zstd"})
+    assert r.status_code == status and (status == 200 or "malformed zstd" in r.json()["detail"])
 
 
 def test_instructions_may_be_left_out(fake_backend):
@@ -171,9 +200,9 @@ def test_one_image_through_assets(fake_backend):
     }
     raw, headers = multipart([("request", "application/json", json.dumps(door).encode()), ("asset-0", "image/png", PNG)])
     c = api(fake_backend)
-    for body, extra in ((raw, {}), (gzip.compress(raw), {"Content-Encoding": "gzip"})):  # the SDK compresses multipart bodies too
+    for sent, extra in ((raw, {}), (gzip.compress(raw), {"Content-Encoding": "gzip"})):  # the SDK compresses multipart bodies too
         fake_backend.prompts.clear()
-        r = c.post("/v1/systemone", content=body, headers={**headers, **extra})
+        r = c.post("/v1/systemone", content=sent, headers={**headers, **extra})
         ((image, text),) = fake_backend.prompts
         assert r.status_code == 200 and r.json()["model"] == "jev-latest"
         assert image == {"type": "image_url", "image_url": {"url": data_url("image/png", PNG)}} and 'State:\n{"note": "front door"}\n' in text["text"]
@@ -181,6 +210,35 @@ def test_one_image_through_assets(fake_backend):
     post(c, json.dumps({"state": "photo", "assets": {"photo": {**b64(JPEG), "format": "jpg"}}, "questions": NOUL}).encode())
     ((image, text),) = fake_backend.prompts
     assert image["image_url"]["url"] == data_url("image/jpeg", JPEG) and "State:\n(see screenshot)\n" in text["text"]
+
+
+def test_an_image_beside_a_deeply_nested_state(fake_backend):
+    """Nesting deeper than Python's recursion limit, which the JSON parser still reads: the image reference is found all the same."""
+    deep = "[" * 5000 + "]" * 5000
+    raw = f'{{"state": {{"door": "r1", "deep": {deep}}}, "assets": {json.dumps({"r1": b64(PNG)})}, "questions": {json.dumps(NOUL)}}}'
+    r = post(api(fake_backend), raw.encode())
+    assert r.status_code == 200 and fake_backend.prompts[0][0]["image_url"]["url"] == data_url("image/png", PNG)
+
+
+def test_a_multipart_body_holds_at_most_two_parts(fake_backend, monkeypatch):
+    """The JSON and at most one image: a third part is a 400, found by counting boundaries before any part is parsed."""
+
+    def unread(piece):
+        raise AssertionError("a part was parsed")
+
+    monkeypatch.setattr(body, "read_part", unread)
+    raw, headers = multipart([("request", "application/json", json.dumps(REQ).encode()), ("asset-0", "image/png", PNG), ("asset-1", "image/png", PNG)])
+    r = api(fake_backend).post("/v1/systemone", content=raw, headers=headers)
+    assert r.status_code == 400 and "at most one image" in r.json()["detail"]
+
+
+@pytest.mark.parametrize(("size", "status"), [(8 * 1024, 200), (8 * 1024 + 1, 400)])
+def test_a_multipart_part_has_at_most_8_kib_of_headers(fake_backend, size, status):
+    prefix = 'Content-Disposition: form-data; name="asset-0"; filename="asset-0"\r\nContent-Type: image/png\r\nX-Pad: '
+    kind = "image/png\r\nX-Pad: " + "a" * (size - len(prefix))  # the part's header block is prefix + padding: `size` bytes
+    door = {"state": "ref-7c1e", "assets": {"ref-7c1e": {"part": "asset-0"}}, "questions": NOUL}
+    raw, headers = multipart([("request", "application/json", json.dumps(door).encode()), ("asset-0", kind, PNG)])
+    assert api(fake_backend).post("/v1/systemone", content=raw, headers=headers).status_code == status
 
 
 BAD_ASSETS = {
@@ -209,23 +267,20 @@ def test_images_the_model_cannot_read_are_400(fake_backend, why):
     assert r.status_code == 400 and isinstance(r.json()["detail"], str) and fake_backend.prompts == []
 
 
+def door_json(asset):
+    return json.dumps({"state": "ref-7c1e", "assets": {"ref-7c1e": asset}, "questions": NOUL}).encode()
+
+
 @pytest.mark.parametrize(
-    "parts",
+    ("parts", "says"),
     [
-        [("asset-0", "image/png", PNG), ("request", "application/json", b"{}")],
-        [
-            ("request", "application/json", json.dumps({"state": "r", "assets": {"r": {"part": "asset-0"}}, "questions": NOUL}).encode()),
-            ("asset-0", "image/png", PNG),
-            ("asset-1", "image/png", PNG),
-        ],
-        [
-            ("request", "application/json", json.dumps({"state": "r", "assets": {"r": {"part": "asset-9"}}, "questions": NOUL}).encode()),
-            ("asset-0", "image/png", PNG),
-        ],
+        ([("asset-0", "image/png", PNG), ("request", "application/json", b"{}")], "first part, named request"),
+        ([("request", "application/json", door_json(b64(PNG))), ("asset-0", "image/png", PNG)], "belong to no asset"),
+        ([("request", "application/json", door_json({"part": "asset-9"})), ("asset-0", "image/png", PNG)], "multipart part is missing"),
     ],
     ids=["request-not-first", "part-without-asset", "asset-part-missing"],
 )
-def test_malformed_multipart_is_400(fake_backend, parts):
+def test_malformed_multipart_is_400(fake_backend, parts, says):
     raw, headers = multipart(parts)
     r = api(fake_backend).post("/v1/systemone", content=raw, headers=headers)
-    assert r.status_code == 400 and r.json()["error"]["code"] == 400
+    assert r.status_code == 400 and says in r.json()["detail"]

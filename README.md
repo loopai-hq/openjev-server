@@ -202,10 +202,10 @@ print(answers["route"]["choice"], answers["route"]["probabilities"], answers["an
 | `instructions` left out | supported; a neutral default instruction is used. Answers in this shape are not measured |
 | `state` as text, object or array | supported; an array is sent to the model as JSON text |
 | one image in `state` | supported, on models with a vision tower |
-| one image through `assets`, base64 in the JSON or a multipart body | supported; it takes the same path as `state.image`. Not measured on the model |
+| one image through `assets`, base64 in the JSON or a multipart body | supported; it takes the same path as `state.image`. A multipart body holds the JSON and at most one image part, each with at most 8 KiB of part headers. Not measured on the model |
 | several images, or images in `instructions` or `criteria` | not supported (400) |
 | `box` questions | not supported (422) |
-| gzip and zstd request bodies | supported, one layer |
+| gzip and zstd request bodies | supported, one layer: one gzip member, zstd windows up to 32 MiB |
 | request body up to 32 MiB | supported; 413 above, also after decompression |
 | `GET /v1/models` | supported; `release_date` is the day the server started |
 | JSON errors with `detail` | supported, next to this server's `error` object |

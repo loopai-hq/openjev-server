@@ -1,12 +1,13 @@
 """Request bodies the way clients of the hosted Jev API send them: one compression layer (gzip or zstd), at most 32 MiB as sent and
-after decompression, and one image through `assets`, as base64 in the JSON or as a part of a multipart/form-data body."""
+after decompression, and one image through `assets`, as base64 in the JSON or as a part of a multipart/form-data body. Each step is
+linear in the body's size and bounded in memory, so a small body cannot make the server inflate, allocate or parse much more."""
 
 from __future__ import annotations
 
 import base64
-import email
+import email.message
+import email.parser
 import email.policy
-import gzip
 import io
 import json
 import zlib
@@ -15,7 +16,9 @@ from typing import Any
 import zstandard
 from fastapi import Request
 
-MAX_BODY = 32 * 1024 * 1024  # the hosted API's limit, as sent and after decompression
+MAX_BODY = 32 * 1024 * 1024  # the hosted API's limit, as sent and after decompression; also the largest zstd window decoded
+MAX_PARTS = 2  # a multipart body holds the JSON and at most one image
+MAX_PART_HEADERS = 8 * 1024  # bytes in the header block of one multipart part
 IMAGE_TYPES = {b"\x89PNG\r\n\x1a\n": "image/png", b"\xff\xd8\xff": "image/jpeg"}  # file signature -> type, for the formats the model reads
 
 
@@ -46,42 +49,90 @@ async def read_capped(request: Request) -> bytes:
     async for chunk in request.stream():
         body += chunk
         if len(body) > MAX_BODY:
-            raise BadBody(413, "the body is over 32 MiB")
+            raise BadBody(413, f"the body is over {MAX_BODY >> 20} MiB")
     return bytes(body)
 
 
 def inflate(raw: bytes, encoding: str | None) -> bytes:
-    """The body as sent -> its JSON or multipart bytes. One compression layer; never inflated more than one byte past MAX_BODY."""
+    """The body as sent -> its JSON or multipart bytes. One compression layer, inflated to at most MAX_BODY + 1 bytes."""
     enc = (encoding or "identity").strip().lower()
     if enc == "identity":
         return raw
     if enc not in ("gzip", "x-gzip", "zstd"):
         raise BadBody(415, f"unsupported Content-Encoding {encoding!r}: use gzip, x-gzip or zstd, one layer")
-    source = io.BytesIO(raw)
-    reader = zstandard.ZstdDecompressor().stream_reader(source, read_across_frames=True) if enc == "zstd" else gzip.GzipFile(fileobj=source)
     try:
-        data = reader.read(MAX_BODY + 1)
-    except (OSError, EOFError, zlib.error, zstandard.ZstdError) as e:
+        data = unzstd(raw) if enc == "zstd" else gunzip(raw)
+    except (zlib.error, zstandard.ZstdError) as e:
         raise BadBody(400, f"malformed {enc} body: {e}") from None
     if len(data) > MAX_BODY:
-        raise BadBody(413, "the body is over 32 MiB after decompression")
+        raise BadBody(413, f"the body is over {MAX_BODY >> 20} MiB after decompression")
     return data
 
 
+def gunzip(raw: bytes) -> bytes:
+    """One gzip member, inflated to at most MAX_BODY + 1 bytes. A second member is refused: read one by one, members cost a
+    Python loop each, and 32 MiB of empty ones would keep the server busy for half a minute."""
+    inflater = zlib.decompressobj(zlib.MAX_WBITS | 16)  # gzip framing
+    data = inflater.decompress(raw, MAX_BODY + 1)
+    if len(data) > MAX_BODY:
+        return data
+    if not inflater.eof:
+        raise zlib.error("truncated")
+    if inflater.unused_data:
+        raise zlib.error("more than one gzip member")
+    return data
+
+
+def unzstd(raw: bytes) -> bytes:
+    """zstd frames inflated to at most MAX_BODY + 1 bytes. A frame of a few bytes may ask for any window; one above MAX_BODY is
+    refused before it is allocated."""
+    decoder = zstandard.ZstdDecompressor(max_window_size=MAX_BODY)
+    return decoder.stream_reader(io.BytesIO(raw), read_across_frames=True).read(MAX_BODY + 1)
+
+
 def split_multipart(data: bytes, content_type: str) -> tuple[bytes, dict[str, bytes]]:
-    """multipart/form-data (RFC 7578) -> (the JSON of its first part, named `request`; {name: bytes} of the other parts)."""
-    msg = email.message_from_bytes(b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + data, policy=email.policy.HTTP)
-    parts = [(p.get_param("name", header="content-disposition"), p.get_payload(decode=True)) for p in msg.iter_parts()]
-    names = [n for n, _ in parts]
+    """multipart/form-data (RFC 7578) -> (the JSON of its first part, named `request`; {name: bytes} of the other parts). The parts
+    are counted and split on the boundary in linear time; only their header blocks, at most 8 KiB each, go through a parser."""
+    delimiter = b"--" + multipart_boundary(content_type)
+    if data.count(delimiter) > MAX_PARTS + 1:  # each part opens with the delimiter, and one more closes the body
+        raise BadBody(400, "a multipart body holds the JSON and at most one image")
+    pieces = data.split(delimiter)[1:]  # what comes before the first delimiter is a preamble
+    end = next((i for i, piece in enumerate(pieces) if piece.startswith(b"--")), None)
+    if end is None:
+        raise BadBody(400, "the multipart body does not end with its closing boundary")
+    parts = [read_part(piece) for piece in pieces[:end]]
+    names = [name for name, _ in parts]
     if not names or names[0] != "request" or not all(names) or len(set(names)) < len(names):
         raise BadBody(400, "a multipart body is the JSON as its first part, named request, then one uniquely named part per image")
-    return parts[0][1] or b"", dict(parts[1:])
+    return parts[0][1], dict(parts[1:])
+
+
+def multipart_boundary(content_type: str) -> bytes:
+    """The boundary parameter of a multipart Content-Type: 1 to 70 characters (RFC 2046)."""
+    header = email.message.Message()
+    header["content-type"] = content_type
+    boundary = header.get_param("boundary")
+    if not isinstance(boundary, str) or not 0 < len(boundary) <= 70:
+        raise BadBody(400, "a multipart body needs a boundary of 1 to 70 characters in its Content-Type")
+    return boundary.encode("latin-1")
+
+
+def read_part(piece: bytes) -> tuple[str | None, bytes]:
+    """One part as it sits between two boundaries -> (its form-data name, its content)."""
+    piece = piece.lstrip(b" \t")  # transport padding after the boundary
+    end = piece.find(b"\r\n\r\n", 0, 2 + MAX_PART_HEADERS + 4)  # the blank line after the header block
+    if not piece.startswith(b"\r\n") or end < 0 or not piece.endswith(b"\r\n"):
+        raise BadBody(400, f"a multipart part is a line break, at most {MAX_PART_HEADERS} bytes of headers, a blank line, its content and a line break")
+    headers = email.parser.BytesHeaderParser(policy=email.policy.HTTP).parsebytes(piece[2:end])
+    return headers.get_param("name", header="content-disposition"), piece[end + 4 : -2]
 
 
 def parse_object(data: bytes) -> dict[str, Any]:
     """The body's JSON, which must be an object. An empty body reads as {}, so validation names what is missing."""
     try:
         body = json.loads(data or b"{}")
+    except RecursionError:
+        raise BadBody(400, "malformed JSON body: nested too deeply") from None
     except ValueError as e:
         raise BadBody(400, f"malformed JSON body: {e}") from None
     if not isinstance(body, dict):
@@ -125,9 +176,15 @@ def asset_bytes(ref: str, asset: dict[str, Any], files: dict[str, bytes]) -> byt
 
 
 def uses(value: Any, ref: str) -> int:
-    """How often `ref` occurs in the strings of `value`; object keys are not searched, as on the hosted API."""
-    if isinstance(value, str):
-        return value.count(ref)
-    if isinstance(value, dict):
-        value = list(value.values())
-    return sum(uses(v, ref) for v in value) if isinstance(value, list) else 0
+    """How often `ref` occurs in the strings of `value`; object keys are not searched, as on the hosted API. Walked with a stack:
+    the JSON parser accepts nesting deeper than Python's recursion limit."""
+    count, todo = 0, [value]
+    while todo:
+        v = todo.pop()
+        if isinstance(v, str):
+            count += v.count(ref)
+        elif isinstance(v, dict):
+            todo.extend(v.values())
+        elif isinstance(v, list):
+            todo.extend(v)
+    return count
