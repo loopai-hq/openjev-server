@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 (2026-11-24)
+- OpenJev 1.1 and OpenJev 1.1 FP4 in the README's models table and quick start. 1.1 keeps v1's calibration, so the `openjev` profile serves both.
+- Read twice: the `repeat` profile field, `--repeat`, or the helper's `READOUT_REPEAT=1`; off by default. Each text prompt goes out twice in one request, a blank line between the copies; screenshot prompts are read once. A doubled prompt that would not fit the backend's window goes out once, and the answer carries `read_once`; `/metrics` counts them as `openjev_read_once_total`. `/v1/version` reports `flags.repeat`.
+- The vLLM backend reads the window from `GET /v1/models` (`max_model_len`) at start, now also when `--served-model-name` is given, and reports it in the startup probe.
+- Requests written for the hosted Jev API (Jev 1.14) on `POST /v1/systemone`, in the new `body.py`: gzip, x-gzip and zstd bodies (415 for other encodings), 32 MiB per body as sent and after decompression (413), one image through `assets` (base64 or multipart), optional `instructions` with a neutral default, one-level scores answered without the model, the requested `model` echoed, and `GET /v1/models`.
+- Every error is JSON with this server's `error` object and the hosted API's `detail`. Malformed JSON and non-object bodies are 400 (they were 422).
+- Requests that 0.2.0 accepted send the same prompts, byte for byte: a new regression test holds them to the released helper's. `tests/test_compat.py` also holds read twice to OpenJev 1.1's helper.
+- New dependency: `zstandard` (the standard library reads zstd only from Python 3.14).
+
 ## 0.2.0 (2026-09-22)
 - Modules by job: `profile.py` (calibration constants), `prompt.py` (state text and prompt layouts), `readout.py` (scores to answers), `backends/base.py` (the backend contract), `backends/make_backend` (the only place that knows backend names). Answers unchanged: the compat tests against the released helper still hold.
 - Server: `/v1` routes on one router with bearer auth as a router dependency; operations endpoints on their own router.
