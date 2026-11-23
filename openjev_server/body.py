@@ -17,6 +17,7 @@ import zstandard
 from fastapi import Request
 
 MAX_BODY = 32 * 1024 * 1024  # the hosted API's limit, as sent and after decompression; also the largest zstd window decoded
+STEP = 1024 * 1024  # inflated bytes read at a time, so memory grows with what a body holds rather than with the limit
 MAX_PARTS = 2  # a multipart body holds the JSON and at most one image
 MAX_PART_HEADERS = 8 * 1024  # bytes in the header block of one multipart part
 IMAGE_TYPES = {b"\x89PNG\r\n\x1a\n": "image/png", b"\xff\xd8\xff": "image/jpeg"}  # file signature -> type, for the formats the model reads
@@ -54,28 +55,25 @@ async def read_capped(request: Request) -> bytes:
 
 
 def inflate(raw: bytes, encoding: str | None) -> bytes:
-    """The body as sent -> its JSON or multipart bytes. One compression layer, inflated to at most MAX_BODY + 1 bytes."""
+    """The body as sent -> its JSON or multipart bytes. One compression layer, never inflated much past MAX_BODY."""
     enc = (encoding or "identity").strip().lower()
     if enc == "identity":
         return raw
     if enc not in ("gzip", "x-gzip", "zstd"):
         raise BadBody(415, f"unsupported Content-Encoding {encoding!r}: use gzip, x-gzip or zstd, one layer")
     try:
-        data = unzstd(raw) if enc == "zstd" else gunzip(raw)
+        return unzstd(raw) if enc == "zstd" else gunzip(raw)
     except (zlib.error, zstandard.ZstdError) as e:
         raise BadBody(400, f"malformed {enc} body: {e}") from None
-    if len(data) > MAX_BODY:
-        raise BadBody(413, f"the body is over {MAX_BODY >> 20} MiB after decompression")
-    return data
 
 
 def gunzip(raw: bytes) -> bytes:
-    """One gzip member, inflated to at most MAX_BODY + 1 bytes. A second member is refused: read one by one, members cost a
-    Python loop each, and 32 MiB of empty ones would keep the server busy for half a minute."""
+    """One gzip member, inflated by zlib to at most MAX_BODY + 1 bytes; zlib grows its output in steps. A second member is
+    refused: Python's gzip reader loops once per member, and 32 MiB of empty members kept it busy for 26 s."""
     inflater = zlib.decompressobj(zlib.MAX_WBITS | 16)  # gzip framing
     data = inflater.decompress(raw, MAX_BODY + 1)
     if len(data) > MAX_BODY:
-        return data
+        raise inflated_too_far()
     if not inflater.eof:
         raise zlib.error("truncated")
     if inflater.unused_data:
@@ -84,10 +82,26 @@ def gunzip(raw: bytes) -> bytes:
 
 
 def unzstd(raw: bytes) -> bytes:
-    """zstd frames inflated to at most MAX_BODY + 1 bytes. A frame of a few bytes may ask for any window; one above MAX_BODY is
-    refused before it is allocated."""
+    """One zstd frame with a window of at most MAX_BODY (a frame of a few bytes may ask for any window). Its size is measured in
+    1 MiB steps first, so a bomb stops at the limit; only a frame known to fit is decoded whole, which also shows whether it is
+    complete: the zstd library does not report a frame cut short while streaming."""
     decoder = zstandard.ZstdDecompressor(max_window_size=MAX_BODY)
-    return decoder.stream_reader(io.BytesIO(raw), read_across_frames=True).read(MAX_BODY + 1)
+    reader, size = decoder.stream_reader(io.BytesIO(raw)), 0
+    while chunk := reader.read(STEP):
+        size += len(chunk)
+        if size > MAX_BODY:
+            raise inflated_too_far()
+    frame = decoder.decompressobj()
+    data = frame.decompress(raw)
+    if not frame.eof:
+        raise zstandard.ZstdError("truncated")
+    if frame.unused_data:
+        raise zstandard.ZstdError("more than one zstd frame")
+    return data
+
+
+def inflated_too_far() -> BadBody:
+    return BadBody(413, f"the body is over {MAX_BODY >> 20} MiB after decompression")
 
 
 def split_multipart(data: bytes, content_type: str) -> tuple[bytes, dict[str, bytes]]:

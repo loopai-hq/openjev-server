@@ -4,6 +4,7 @@
 import base64
 import gzip
 import json
+import tracemalloc
 
 import pytest
 import zstandard
@@ -93,11 +94,26 @@ def test_compressed_bodies_send_the_same_prompts(fake_backend, encoding):
         (gzip.compress(json.dumps(REQ).encode())[:-8], {"Content-Encoding": "gzip"}, 400, "truncated"),
         (gzip.compress(json.dumps(REQ).encode()) + gzip.compress(b""), {"Content-Encoding": "gzip"}, 400, "one gzip member"),
         (b"not zstd", {"Content-Encoding": "zstd"}, 400, "malformed zstd"),
+        (zstandard.ZstdCompressor().compress(json.dumps(REQ).encode())[:-5], {"Content-Encoding": "zstd"}, 400, "malformed zstd body: truncated"),
+        (b"".join(map(zstandard.ZstdCompressor().compress, (b'{"state": "s", ', b'"questions": {}}'))), {"Content-Encoding": "zstd"}, 400, "one zstd frame"),
         (json.dumps(REQ).encode(), {"Content-Encoding": "br"}, 415, "unsupported"),
         (sized(MIB32 + 1), {}, 413, "32 MiB"),
         (gzip.compress(sized(MIB32 + 1)), {"Content-Encoding": "gzip"}, 413, "32 MiB"),
     ],
-    ids=["json", "nested", "not-object", "gzip", "gzip-truncated", "gzip-members", "zstd", "encoding", "size", "size-inflated"],
+    ids=[
+        "json",
+        "nested",
+        "not-object",
+        "gzip",
+        "gzip-truncated",
+        "gzip-members",
+        "zstd",
+        "zstd-truncated",
+        "zstd-frames",
+        "encoding",
+        "size",
+        "size-inflated",
+    ],
 )
 def test_unreadable_bodies_are_json_errors(fake_backend, raw, headers, status, says):
     r = post(api(fake_backend), raw, **headers)
@@ -120,6 +136,20 @@ def test_bodies_that_inflate_past_the_limit_are_413(fake_backend, monkeypatch, e
     packed = zstandard.ZstdCompressor().compress(raw) if encoding == "zstd" else gzip.compress(raw)
     r = post(api(fake_backend), packed, **{"Content-Encoding": encoding})
     assert len(packed) < 64 * 1024 and r.status_code == 413 and r.json()["detail"] == "the body is over 4 MiB after decompression"
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "zstd"])
+def test_a_small_body_inflates_in_small_steps(encoding):
+    """Inflating reads in steps of at most 1 MiB: a small body never makes the server allocate anything near the 32 MiB limit."""
+    raw = json.dumps(REQ).encode()
+    packed = zstandard.ZstdCompressor().compress(raw) if encoding == "zstd" else gzip.compress(raw)
+    tracemalloc.start()
+    try:
+        assert body.inflate(packed, encoding) == raw
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 2 * 1024 * 1024, peak
 
 
 @pytest.mark.parametrize(("window_log", "status"), [(25, 200), (26, 400)])
