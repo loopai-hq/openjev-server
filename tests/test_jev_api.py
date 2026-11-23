@@ -46,7 +46,7 @@ def b64(raw):
 
 
 def multipart(parts):
-    """The official Python SDK's wire shape: the JSON as the first part, named `request`, then one part per image."""
+    """The hosted API's multipart shape: the JSON as the first part, named `request`, then one part per image."""
     b = "9f2c41d0b7e84a6c"
 
     def head(name, kind):
