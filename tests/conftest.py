@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import os
 
@@ -43,15 +44,21 @@ def fake_scores(content, token_ids):
     return out
 
 
+@functools.cache
+def shared_tokenizer():
+    """The test tokenizer, loaded once for the session: tests only read it."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(TOKENIZER)
+
+
 class FakeBackend:
     """Answers the readout's one question from fake_scores; records every prompt it saw."""
 
     def __init__(self):
-        from transformers import AutoTokenizer
-
         from openjev_server.backends.letters import header_counter, letter_ids
 
-        self.tok = AutoTokenizer.from_pretrained(TOKENIZER)
+        self.tok = shared_tokenizer()
         self._ids, self.letter_prefix = letter_ids(self.tok)
         self._header = header_counter(self.tok)
         self.prompts = []

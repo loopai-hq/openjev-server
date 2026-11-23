@@ -1,8 +1,8 @@
 """The one-pass readout: letter scores -> calibrated probabilities -> answers (choice / score / noul).
 
 The calibration math, the two-stage fallback above 52 options and the confidence formulas are the ones of OpenJev's released helper
-(helper/shim.py, sha 81a22f1b): with the same profile constants this module produces the same answers, and tests/test_compat.py
-holds that equality on fixtures.
+(helper/shim.py, sha 81a22f1b), and read twice is the one of OpenJev 1.1's helper (sha 0f04305c): with the same profile constants
+this module produces the same answers, and tests/test_compat.py holds that equality on fixtures.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from .profile import Profile
 from .prompt import State, build_prompt, make_state, prefix_text
 
 MAX_ONE_PASS = len(LETTERS)
+# The hosted API lets a question leave out its instructions; these neutral ones stand in. Answers in that shape are not measured.
+DEFAULT_INSTRUCTIONS = {"choice": "Which option is correct?", "score": "Rate the content above.", "noul": "Is the statement true?"}
 
 
 class ReadoutIncomplete(RuntimeError):
@@ -142,7 +144,7 @@ class Readout:
     def _instr(self, q: dict) -> str:
         i = q.get("instructions")
         if i is None:
-            raise BadQuestion("instructions is required")
+            return DEFAULT_INSTRUCTIONS[q["type"]]
         if isinstance(i, str):
             return i
         return str(i) if self.profile.instr_style == "pyrepr" else json.dumps(i, ensure_ascii=False)
@@ -167,10 +169,13 @@ class Readout:
 
     async def answer_score(self, state_text: State, q: dict) -> tuple[dict, Usage]:
         levels = q.get("criteria")
-        if not isinstance(levels, list) or len(levels) < 2:
-            raise BadQuestion("score.criteria must be an ordered array of at least two levels")
+        if not isinstance(levels, list) or not levels:
+            raise BadQuestion("score.criteria must be an ordered array of at least one level")
         opts = [(str(i), self._desc(level)) for i, level in enumerate(levels)]
-        p, usage = await self.distribution(state_text, self._instr(q) + " Rate along the ordered levels below (lowest first).", opts)
+        if len(opts) == 1:  # nothing to choose: all probability on the one level, no model call
+            p, usage = [1.0], Usage()
+        else:
+            p, usage = await self.distribution(state_text, self._instr(q) + " Rate along the ordered levels below (lowest first).", opts)
         return {
             "type": "score",
             "score": round(sum(i * pi for i, pi in enumerate(p)), 4),

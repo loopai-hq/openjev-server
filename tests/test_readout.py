@@ -31,9 +31,7 @@ def test_bad_questions(fake_backend):
     with pytest.raises(BadQuestion):
         asyncio.run(ro.answer_all("s", {"q": {"type": "choice", "instructions": "x", "criteria": {}}}))
     with pytest.raises(BadQuestion):
-        asyncio.run(ro.answer_all("s", {"q": {"type": "score", "instructions": "x", "criteria": ["one"]}}))
-    with pytest.raises(BadQuestion):
-        asyncio.run(ro.answer_all("s", {"q": {"type": "choice", "criteria": {"a": None}}}))
+        asyncio.run(ro.answer_all("s", {"q": {"type": "score", "instructions": "x", "criteria": []}}))
     with pytest.raises(BadQuestion):
         asyncio.run(ro.answer_all("s", {"q": {"type": "essay"}}))
 

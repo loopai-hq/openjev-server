@@ -13,6 +13,7 @@ dependencies = [
   "pydantic-settings>=2.3",
   "prometheus-client>=0.20",
   "transformers>=4.57",
+  "zstandard>=0.23",  # zstd request bodies, which the hosted API's SDKs send by default; the standard library reads zstd only from Python 3.14
 ]
 
 [project.optional-dependencies]

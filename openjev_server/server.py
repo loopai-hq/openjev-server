@@ -1,5 +1,6 @@
-"""The HTTP surface: POST /v1/systemone (decisions), POST /v1/prewarm, GET /v1/version, GET /healthz, GET /readyz, GET /metrics,
-POST /v1/chat/completions (passthrough for clients that also type text). Bearer auth on /v1/* when a token is configured."""
+"""The HTTP surface: POST /v1/systemone (decisions), POST /v1/prewarm, GET /v1/version, GET /v1/models, GET /healthz, GET /readyz,
+GET /metrics, POST /v1/chat/completions (passthrough for clients that also type text). Bearer auth on /v1/* when a token is configured.
+Every error is JSON: our `error` object next to the hosted API's `detail`."""
 
 from __future__ import annotations
 
@@ -14,12 +15,15 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .backends.base import BackendError
+from .body import BadBody, read_body
 from .readout import BadQuestion, Readout, ReadoutIncomplete
 
 log = logging.getLogger("openjev")
@@ -59,6 +63,23 @@ class PrewarmRequest(BaseModel):
 
 def http_error(status: int, message: str) -> HTTPException:
     return HTTPException(status, {"code": status, "message": message})
+
+
+def error_response(status: int, message: str, detail: Any = None, headers: dict[str, str] | None = None) -> JSONResponse:
+    """Our {"error": {code, message}} next to the hosted API's `detail`: the message, or for 422 a list of {loc, msg, type}."""
+    if detail is None:
+        detail = [{"loc": ["body"], "msg": message, "type": "value_error"}] if status == 422 else message
+    return JSONResponse({"error": {"code": status, "message": message}, "detail": detail}, status_code=status, headers=headers)
+
+
+async def systemone_request(request: Request) -> SystemOneRequest:
+    """POST /v1/systemone's body, read the way the hosted API's clients send it: compressed, multipart, an image through `assets`."""
+    try:
+        return SystemOneRequest.model_validate(await read_body(request))
+    except BadBody as e:
+        raise http_error(e.status, str(e)) from e
+    except ValidationError as e:
+        raise RequestValidationError([{**err, "loc": ("body", *err["loc"])} for err in e.errors()]) from e
 
 
 def version_info(readout: Readout, *, backend_name: str, model_dir: str, extra: dict | None) -> dict:
@@ -122,13 +143,20 @@ def ops_router(readout: Readout, backend_name: str) -> APIRouter:
 
 
 def api_router(readout: Readout, version: dict, model_string: str, token: str) -> APIRouter:
-    """The /v1 API: version, prewarm, systemone, chat passthrough."""
+    """The /v1 API: version, models, prewarm, systemone, chat passthrough."""
     r = APIRouter(prefix="/v1", dependencies=[Depends(bearer_auth(token))])
+    started = time.strftime("%Y-%m-%d", time.gmtime())
 
     @r.get("/version")
     @r.post("/version")
     async def get_version():
         return version
+
+    @r.get("/models")
+    async def models():
+        """The served model in the hosted API's shape (its SDKs list models). The model's own release date is unknown here."""
+        description = "The decision model this server serves. release_date is the day the server started; GET /v1/version has the calibration and flags."
+        return {"models": [{"name": version["model_dir"], "release_date": started, "description": description}]}
 
     @r.post("/prewarm")
     async def prewarm(body: PrewarmRequest):
@@ -141,25 +169,14 @@ def api_router(readout: Readout, version: dict, model_string: str, token: str) -
         return {"ok": True, "prompt_tokens": n}
 
     @r.post("/systemone")
-    async def systemone(body: SystemOneRequest):
+    async def systemone(request: Request):
+        body = await systemone_request(request)
         rid = f"oj-{uuid.uuid4().hex[:16]}"
         t0 = time.perf_counter()
-        INFLIGHT.inc()
-        try:
-            answers, toks = await readout.answer_all(body.state, {k: q.model_dump() for k, q in body.questions.items()})
-        except BadQuestion as e:
-            REQS.labels("422").inc()
-            raise http_error(422, str(e)) from e
-        except ReadoutIncomplete as e:
-            REQS.labels("502").inc()
-            raise http_error(502, f"readout incomplete: {e}") from e
-        except BackendError as e:
-            REQS.labels("502").inc()
-            raise http_error(502, str(e)[:300]) from e
-        finally:
-            INFLIGHT.dec()
+        answers, toks = await answer_request(readout, body)
         record(rid, answers, toks, time.perf_counter() - t0)
-        return {"id": rid, "model": model_string, "answers": answers, "usage": {"input_tokens": toks, "output_tokens": 0}}
+        model = model_string if body.model is None else body.model  # the requested model is echoed, as on the hosted API
+        return {"id": rid, "model": model, "answers": answers, "usage": {"input_tokens": toks, "output_tokens": 0}}
 
     @r.post("/chat/completions")
     async def chat(request: Request):
@@ -170,6 +187,24 @@ def api_router(readout: Readout, version: dict, model_string: str, token: str) -
         return Response(data, status_code=code, media_type="application/json")
 
     return r
+
+
+async def answer_request(readout: Readout, body: SystemOneRequest) -> tuple[dict[str, dict], int]:
+    """The answers and prompt tokens of one request. A bad question is a 422; a model server that fails is a 502."""
+    INFLIGHT.inc()
+    try:
+        return await readout.answer_all(body.state, {k: q.model_dump() for k, q in body.questions.items()})
+    except BadQuestion as e:
+        REQS.labels("422").inc()
+        raise http_error(422, str(e)) from e
+    except ReadoutIncomplete as e:
+        REQS.labels("502").inc()
+        raise http_error(502, f"readout incomplete: {e}") from e
+    except BackendError as e:
+        REQS.labels("502").inc()
+        raise http_error(502, str(e)[:300]) from e
+    finally:
+        INFLIGHT.dec()
 
 
 def record(rid: str, answers: dict[str, dict], toks: int, dt: float) -> None:
@@ -198,10 +233,15 @@ def build_app(readout: Readout, *, token: str = "", model_dir: str = "", backend
 
     app = FastAPI(title="openjev-server", version=__version__, lifespan=lifespan, docs_url="/docs", redoc_url=None)
 
-    @app.exception_handler(HTTPException)
-    async def _http_exc(request, exc: HTTPException):
-        detail = exc.detail if isinstance(exc.detail, dict) else {"code": exc.status_code, "message": str(exc.detail)}
-        return JSONResponse({"error": detail}, status_code=exc.status_code)
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exc(request, exc: StarletteHTTPException):
+        message = exc.detail["message"] if isinstance(exc.detail, dict) else str(exc.detail)
+        return error_response(exc.status_code, message, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def _invalid(request, exc: RequestValidationError):
+        detail = [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+        return error_response(422, "; ".join(f"{'.'.join(map(str, d['loc']))}: {d['msg']}" for d in detail), detail)
 
     app.include_router(ops_router(readout, backend_name))
     app.include_router(api_router(readout, version, model_string, token))
