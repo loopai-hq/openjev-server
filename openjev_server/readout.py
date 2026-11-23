@@ -62,28 +62,51 @@ def compose_chunks(parts: list[tuple[list[float], int]], final: list[float]) -> 
     return [v / s for v in raw]
 
 
+@dataclass(frozen=True)
+class Usage:
+    """What the reads behind one answer cost: prompt tokens, and how many went out once because read twice's doubled prompt would
+    not fit the backend's window."""
+
+    tokens: int = 0
+    read_once: int = 0
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(self.tokens + other.tokens, self.read_once + other.read_once)
+
+
 @dataclass
 class Readout:
     backend: Backend
     profile: Profile
     stats: dict[str, int] = field(default_factory=lambda: {"calls": 0, "prompt_tokens": 0})
 
-    async def _once(self, state_text: State, instructions: str, options: list[tuple[str, str]]) -> tuple[list[float], int]:
+    async def _once(self, state_text: State, instructions: str, options: list[tuple[str, str]]) -> tuple[list[float], Usage]:
         """One lettering, one prefill: temperature-scaled probabilities aligned with `options`."""
         ids = self.backend.letter_ids()
         allowed = [ids[LETTERS[i]] for i in range(len(options))]
         if len(set(allowed)) != len(allowed):
             raise ReadoutIncomplete("candidate token ids are not unique for this tokenizer")
-        content = build_prompt(state_text, instructions, options, self.profile, self.backend)
+        content, once = self._read_twice(build_prompt(state_text, instructions, options, self.profile, self.backend))
         raw, tokens = await self.backend.logprobs(content, allowed)
         if len(raw) != len(allowed) or any(v is None or not math.isfinite(v) for v in raw):
             n = sum(1 for v in raw if v is None or not math.isfinite(v))
             raise ReadoutIncomplete(f"{n} of {len(allowed)} candidate scores missing or not finite")
         self.stats["calls"] += 1
         self.stats["prompt_tokens"] += tokens
-        return softmax([v / self.profile.temp for v in raw]), tokens
+        return softmax([v / self.profile.temp for v in raw]), Usage(tokens, once)
 
-    async def readout(self, state_text: State, instructions: str, options: list[tuple[str, str]]) -> tuple[list[float], int]:
+    def _read_twice(self, content: str | list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]], int]:
+        """`profile.repeat`: a text prompt, a blank line, then the same prompt again, when that plus the read's one output token fits the
+        backend's window (or the window is unknown); else the prompt once, counted. Screenshot prompts are always read once."""
+        if not self.profile.repeat or not isinstance(content, str):
+            return content, 0
+        twice = f"{content}\n\n{content}"
+        window = self.backend.window
+        if window is None or self.backend.header_tokens(twice) + 1 <= window:
+            return twice, 0
+        return content, 1
+
+    async def readout(self, state_text: State, instructions: str, options: list[tuple[str, str]]) -> tuple[list[float], Usage]:
         """Averages over `profile.perms` letterings; probabilities stay aligned with the caller's option order."""
         if self.profile.perms <= 1:
             return await self._once(state_text, instructions, options)
@@ -94,14 +117,14 @@ class Readout:
             orders.append(order)
         results = await asyncio.gather(*(self._once(state_text, instructions, [options[i] for i in order]) for order in orders))
         acc = [0.0] * len(options)
-        tokens = 0
-        for order, (p, t) in zip(orders, results, strict=True):
-            tokens += t
+        usage = Usage()
+        for order, (p, u) in zip(orders, results, strict=True):
+            usage += u
             for pos, i in enumerate(order):
                 acc[i] += p[pos] / self.profile.perms
-        return acc, tokens
+        return acc, usage
 
-    async def distribution(self, state_text: State, instructions: str, opts: list[tuple[str, str]]) -> tuple[list[float], int]:
+    async def distribution(self, state_text: State, instructions: str, opts: list[tuple[str, str]]) -> tuple[list[float], Usage]:
         """Up to 52 options in one pass; above that per-chunk readouts (run concurrently), then one over the chunk winners, composed."""
         if len(opts) <= MAX_ONE_PASS:
             return await self.readout(state_text, instructions, opts)
@@ -110,9 +133,9 @@ class Readout:
         chunks = [opts[i : i + size] for i in range(0, len(opts), size)]
         chunk_results = await asyncio.gather(*(self.readout(state_text, instructions, chunk) for chunk in chunks))
         parts = [(p, max(range(len(p)), key=p.__getitem__)) for p, _ in chunk_results]
-        tokens = sum(t for _, t in chunk_results)
-        final, t = await self.readout(state_text, instructions, [chunk[w] for chunk, (_, w) in zip(chunks, parts, strict=True)])
-        return compose_chunks(parts, final), tokens + t
+        usage = sum((u for _, u in chunk_results), Usage())
+        final, u = await self.readout(state_text, instructions, [chunk[w] for chunk, (_, w) in zip(chunks, parts, strict=True)])
+        return compose_chunks(parts, final), usage + u
 
     # ---- answer types
 
@@ -128,50 +151,52 @@ class Readout:
     def _desc(v) -> str:
         return "" if v is None else (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
 
-    async def answer_choice(self, state_text: State, q: dict) -> tuple[dict, int]:
+    async def answer_choice(self, state_text: State, q: dict) -> tuple[dict, Usage]:
         crit = q.get("criteria")
         if not isinstance(crit, dict) or not crit:
             raise BadQuestion("choice.criteria must be a non-empty map of option -> description|null")
         opts = [(k, self._desc(v)) for k, v in crit.items()]
-        p, tokens = await self.distribution(state_text, self._instr(q), opts)
+        p, usage = await self.distribution(state_text, self._instr(q), opts)
         choice = opts[max(range(len(p)), key=lambda i: p[i])][0]  # winner picked before rounding
         return {
             "type": "choice",
             "choice": choice,
             "probabilities": {k: round(v, 4) for (k, _), v in zip(opts, p, strict=True)},
             "confidence": round(choice_confidence(p), 4),
-        }, tokens
+        }, usage
 
-    async def answer_score(self, state_text: State, q: dict) -> tuple[dict, int]:
+    async def answer_score(self, state_text: State, q: dict) -> tuple[dict, Usage]:
         levels = q.get("criteria")
         if not isinstance(levels, list) or len(levels) < 2:
             raise BadQuestion("score.criteria must be an ordered array of at least two levels")
         opts = [(str(i), self._desc(level)) for i, level in enumerate(levels)]
-        p, tokens = await self.distribution(state_text, self._instr(q) + " Rate along the ordered levels below (lowest first).", opts)
+        p, usage = await self.distribution(state_text, self._instr(q) + " Rate along the ordered levels below (lowest first).", opts)
         return {
             "type": "score",
             "score": round(sum(i * pi for i, pi in enumerate(p)), 4),
             "legend": {str(i): level for i, level in enumerate(levels)},
             "probabilities": {str(i): round(pi, 4) for i, pi in enumerate(p)},
             "confidence": round(score_confidence(p), 4),
-        }, tokens
+        }, usage
 
-    async def answer_noul(self, state_text: State, q: dict) -> tuple[dict, int]:
+    async def answer_noul(self, state_text: State, q: dict) -> tuple[dict, Usage]:
         crit = q.get("criteria") or {}
         yes = self._desc(crit.get("true")) or "The statement is true."
         no = self._desc(crit.get("false")) or "The statement is false."
-        p, tokens = await self.distribution(state_text, self._instr(q), [("yes", yes), ("no", no)])
+        p, usage = await self.distribution(state_text, self._instr(q), [("yes", yes), ("no", no)])
         py = min(max(p[0], 1e-4), 1 - 1e-4)
         z = math.log(py / (1 - py)) / self.profile.noul_t + self.profile.noul_bias
-        return {"type": "noul", "noul": round(1 / (1 + math.exp(-z)), 4)}, tokens
+        return {"type": "noul", "noul": round(1 / (1 + math.exp(-z)), 4)}, usage
 
     ANSWER: ClassVar[dict[str, str]] = {"choice": "answer_choice", "score": "answer_score", "noul": "answer_noul"}
 
     async def answer(self, state_text: State, q: dict) -> tuple[dict, int]:
+        """One question's answer and its prompt tokens. With read twice, `read_once` counts its reads that went out once."""
         kind = q.get("type") if isinstance(q, dict) else None
         if kind not in self.ANSWER:
             raise BadQuestion("type must be one of choice, score, noul")
-        return await getattr(self, self.ANSWER[kind])(state_text, q)
+        a, usage = await getattr(self, self.ANSWER[kind])(state_text, q)
+        return ({**a, "read_once": usage.read_once} if usage.read_once else a), usage.tokens
 
     async def answer_all(self, state: Any, questions: dict[str, dict]) -> tuple[dict[str, dict], int]:
         """Every question against one state. Questions run concurrently; on a long state the first runs alone so its prefix is cached first."""

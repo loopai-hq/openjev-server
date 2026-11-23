@@ -11,8 +11,13 @@ REQ = {
 }
 
 
-def client(fake_backend, token=""):
-    return TestClient(build_app(Readout(fake_backend, Profile()), token=token, model_dir="/models/openjev", backend_name="fake"))
+def client(fake_backend, token="", profile=None):
+    return TestClient(build_app(Readout(fake_backend, profile or Profile()), token=token, model_dir="/models/openjev", backend_name="fake"))
+
+
+def metric(c, name):
+    """The current value of one unlabelled Prometheus series."""
+    return float(next(line.split()[1] for line in c.get("/metrics").text.splitlines() if line.startswith(name + " ")))
 
 
 def test_systemone_shape(fake_backend):
@@ -49,3 +54,14 @@ def test_version_health_metrics_prewarm(fake_backend):
     m = c.get("/metrics").text
     assert "openjev_requests_total" in m and "openjev_request_seconds" in m
     assert c.post("/v1/prewarm", json={"state": REQ["state"]}).json()["ok"] is True
+
+
+def test_read_twice_is_reported_and_its_fallbacks_counted(fake_backend):
+    """/v1/version names the switch; an answer whose doubled prompt did not fit the window carries read_once, and /metrics adds it up."""
+    assert client(fake_backend).get("/v1/version").json()["flags"]["repeat"] is False
+    fake_backend.window = 1
+    c = client(fake_backend, profile=Profile(repeat=True))
+    assert c.get("/v1/version").json()["flags"]["repeat"] is True
+    before = metric(c, "openjev_read_once_total")
+    assert c.post("/v1/systemone", json=REQ).json()["answers"]["route"]["read_once"] == 1
+    assert metric(c, "openjev_read_once_total") == before + 1

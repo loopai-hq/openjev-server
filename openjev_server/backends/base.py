@@ -11,6 +11,8 @@ class BackendError(RuntimeError):
 
 
 class Backend(Protocol):
+    window: int | None  # the model server's context window in tokens (prompt plus output); None when it does not say
+
     async def start(self) -> dict:
         """Connect / load and report what was found (served model, exact readout, chat template, letter prefix, vision)."""
 
@@ -24,7 +26,7 @@ class Backend(Protocol):
         """Token id of each single-letter option label for this model's tokenizer."""
 
     def header_tokens(self, text: str) -> int:
-        """Token count of chat header + text, used only for prefix padding."""
+        """Token count of chat header + text, what the backend prefills: for prefix padding and the read-twice window check."""
 
     async def healthy(self) -> bool:
         """Liveness of the model server, for GET /readyz."""

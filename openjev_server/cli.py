@@ -19,7 +19,8 @@ def _serve(a):
     s = Settings(**{k: v for k, v in vars(a).items() if v is not None and k in Settings.model_fields})
     logging.basicConfig(level=s.log_level, format="%(message)s")
     profile = load_profile(
-        s.profile, {"perms": a.perms, "temp": a.temp, "noul_t": a.noul_t, "assistant_prefix": a.assistant_prefix, "letter_prefix": a.letter_prefix}
+        s.profile,
+        {"perms": a.perms, "temp": a.temp, "noul_t": a.noul_t, "assistant_prefix": a.assistant_prefix, "letter_prefix": a.letter_prefix, "repeat": a.repeat},
     )
     try:
         backend, extra = make_backend(s, profile)
@@ -74,6 +75,7 @@ def main(argv=None):
     s.add_argument("--token")
     s.add_argument("--profile", help="profile name under profiles/ or a JSON path")
     s.add_argument("--perms", type=int, help="average over N option orders (accuracy mode; costs latency)")
+    s.add_argument("--repeat", action="store_true", default=None, help="read twice: each text prompt sent twice in one request (more GPU time per answer)")
     s.add_argument("--temp", type=float)
     s.add_argument("--noul-t", dest="noul_t", type=float)
     s.add_argument("--no-prefix-cache", dest="prefix_cache", action="store_false", default=None)

@@ -17,6 +17,7 @@ HELPER_ENV = {  # the released helper's READOUT_* variables still work; a CLI fl
     "noul_bias": "READOUT_NOUL_BIAS",
     "perms": "READOUT_PERMS",
     "instr_style": "READOUT_INSTR_STYLE",
+    "repeat": "READOUT_REPEAT",
 }
 
 
@@ -49,5 +50,6 @@ def load_profile(name_or_path: str, overrides: dict | None = None) -> Profile:
             d[k] = v
     for k, env in HELPER_ENV.items():
         if os.environ.get(env) and (overrides or {}).get(k) is None:
-            d[k] = type(Profile.__dataclass_fields__[k].default)(os.environ[env])
+            kind = type(Profile.__dataclass_fields__[k].default)
+            d[k] = os.environ[env] == "1" if kind is bool else kind(os.environ[env])  # a switch is on only for "1", as in the helper
     return Profile.from_dict(d)

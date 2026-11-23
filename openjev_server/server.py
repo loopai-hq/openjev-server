@@ -29,6 +29,7 @@ QUESTIONS = Counter("openjev_questions_total", "questions answered", ["type"])
 TOKENS = Counter("openjev_prompt_tokens_total", "prompt tokens sent to the model")
 LAT = Histogram("openjev_request_seconds", "systemone request latency", buckets=(0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 5, 8, 13))
 INFLIGHT = Gauge("openjev_inflight_requests", "requests in flight")
+READ_ONCE = Counter("openjev_read_once_total", "reads sent once because their doubled prompt (read twice) would not fit the window")
 
 ANSWER_MODULES = ("prompt.py", "readout.py")  # the code that determines answers; its hash is reported by /v1/version
 
@@ -83,6 +84,7 @@ def version_info(readout: Readout, *, backend_name: str, model_dir: str, extra: 
             "pad": p.pad,
             "targeted": True,
             "instr_style": p.instr_style,
+            "repeat": p.repeat,
         },
         "readout_sha256": hashlib.sha256(code).hexdigest(),
         **(extra or {}),
@@ -177,6 +179,7 @@ def record(rid: str, answers: dict[str, dict], toks: int, dt: float) -> None:
     TOKENS.inc(toks)
     for a in answers.values():
         QUESTIONS.labels(a["type"]).inc()
+        READ_ONCE.inc(a.get("read_once", 0))
     ops = {q: a.get("choice") for q, a in answers.items() if "choice" in a}
     log.info(json.dumps({"id": rid, "questions": len(answers), "tokens": toks, "ms": round(dt * 1000), "ops": ops}))
 

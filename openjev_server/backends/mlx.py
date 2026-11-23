@@ -31,6 +31,7 @@ class MlxBackend:
         self._render = lambda content: render(self.tok, content, assistant_prefix)
         self._header = header_counter(self.tok, assistant_prefix)
         self.vision = False  # mlx-lm text models only
+        self.window = None  # mlx-lm enforces no context window, so read twice always sends both copies
 
     async def start(self) -> dict:
         return {

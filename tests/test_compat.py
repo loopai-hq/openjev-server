@@ -67,6 +67,53 @@ def test_http_requests_send_the_released_helpers_prompts(shim, fake_backend):
             assert sorted(map(json.dumps, fake_backend.prompts)) == sorted(map(json.dumps, shim._seen_prompts))
 
 
+def helper_1_1_answers(shim_1_1, state, questions):
+    """The 1.1 helper's answers through its answer_one, which adds read_once when read twice sent a read once."""
+    st = shim_1_1.with_image(state)
+    return {qid: shim_1_1.answer_one(st, q)[0] for qid, q in questions.items()}
+
+
+@pytest.mark.parametrize("state", STATES, ids=["text", "dict", "screenshot"])
+def test_read_twice_equals_released_helper(shim_1_1, fake_backend, monkeypatch, state):
+    """`repeat` against OpenJev 1.1's helper with READOUT_REPEAT=1: the same prompts (text doubled, screenshots once), the same answers."""
+    monkeypatch.setattr(shim_1_1, "REPEAT", True)
+    shim_1_1._seen_prompts.clear()
+    ours, _ = asyncio.run(Readout(fake_backend, Profile(repeat=True)).answer_all(state, QUESTIONS))
+    theirs = helper_1_1_answers(shim_1_1, state, QUESTIONS)
+    assert json.dumps(ours, sort_keys=True) == json.dumps(theirs, sort_keys=True)
+    assert sorted(map(json.dumps, fake_backend.prompts)) == sorted(map(json.dumps, shim_1_1._seen_prompts))
+    texts = [p for p in fake_backend.prompts if isinstance(p, str)]
+    assert all(p.count("\n\nQuestion: ") == 2 for p in texts) and len(texts) == (0 if "screenshot" in state else len(fake_backend.prompts))
+
+
+def test_read_twice_window_edge_equals_released_helper(shim_1_1, fake_backend, monkeypatch):
+    """A doubled prompt that fills the window exactly goes out twice; one token over, it goes out once and the answer says so. Our count
+    of the doubled prompt is the 1.1 helper's, which counts the way vLLM's chat endpoint does."""
+    monkeypatch.setattr(shim_1_1, "REPEAT", True)
+    route = {"route": QUESTIONS["route"]}
+    ro = Readout(fake_backend, Profile(repeat=True))
+    asyncio.run(ro.answer_all(STATES[0], route))
+    (twice,) = fake_backend.prompts
+    need = shim_1_1._prompt_tokens([{"role": "user", "content": twice}]) + 1  # + the one output token of a read
+    for window, sent, once in ((need, twice, None), (need - 1, twice[: (len(twice) - 2) // 2], 1)):
+        monkeypatch.setattr(shim_1_1, "WINDOW", window)
+        fake_backend.window = window
+        fake_backend.prompts.clear()
+        ours = asyncio.run(ro.answer_all(STATES[0], route))[0]["route"]
+        assert fake_backend.prompts == [sent] and ours.get("read_once") == once
+        assert ours == helper_1_1_answers(shim_1_1, STATES[0], route)["route"]
+
+
+def test_read_twice_counts_every_read_sent_once(shim_1_1, fake_backend, monkeypatch):
+    """A window too small for any doubled prompt: every read goes once and each answer counts its reads (120 options: 3 chunks + 1)."""
+    monkeypatch.setattr(shim_1_1, "REPEAT", True)
+    monkeypatch.setattr(shim_1_1, "WINDOW", 1)
+    fake_backend.window = 1
+    ours, _ = asyncio.run(Readout(fake_backend, Profile(repeat=True)).answer_all(STATES[1], QUESTIONS))
+    assert json.dumps(ours, sort_keys=True) == json.dumps(helper_1_1_answers(shim_1_1, STATES[1], QUESTIONS), sort_keys=True)
+    assert ours["many"]["read_once"] == 4 and ours["route"]["read_once"] == 1
+
+
 def test_perms_average_matches(shim, fake_backend, monkeypatch):
     monkeypatch.setattr(shim, "PERMS", 4)
     ro = Readout(fake_backend, Profile(perms=4))
