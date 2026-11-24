@@ -12,7 +12,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -61,6 +61,9 @@ class PrewarmRequest(BaseModel):
     state: Any
 
 
+Body = TypeVar("Body", bound=BaseModel)
+
+
 def http_error(status: int, message: str) -> HTTPException:
     return HTTPException(status, {"code": status, "message": message})
 
@@ -72,10 +75,11 @@ def error_response(status: int, message: str, detail: Any = None, headers: dict[
     return JSONResponse({"error": {"code": status, "message": message}, "detail": detail}, status_code=status, headers=headers)
 
 
-async def systemone_request(request: Request) -> SystemOneRequest:
-    """POST /v1/systemone's body, read the way the hosted API's clients send it: compressed, multipart, an image through `assets`."""
+async def read_request(request: Request, model: type[Body]) -> Body:
+    """A POST body read the way the hosted API's clients send it (capped, compressed, multipart, an image through `assets`), then
+    validated as `model`. Routes call it themselves, so the bearer check runs before any of the body is read."""
     try:
-        return SystemOneRequest.model_validate(await read_body(request))
+        return model.model_validate(await read_body(request))
     except BadBody as e:
         raise http_error(e.status, str(e)) from e
     except ValidationError as e:
@@ -159,7 +163,8 @@ def api_router(readout: Readout, version: dict, model_string: str, token: str) -
         return {"models": [{"name": version["model_dir"], "release_date": started, "description": description}]}
 
     @r.post("/prewarm")
-    async def prewarm(body: PrewarmRequest):
+    async def prewarm(request: Request):
+        body = await read_request(request, PrewarmRequest)
         t0 = time.perf_counter()
         try:
             n = await readout.prewarm(body.state)
@@ -170,7 +175,7 @@ def api_router(readout: Readout, version: dict, model_string: str, token: str) -
 
     @r.post("/systemone")
     async def systemone(request: Request):
-        body = await systemone_request(request)
+        body = await read_request(request, SystemOneRequest)
         rid = f"oj-{uuid.uuid4().hex[:16]}"
         t0 = time.perf_counter()
         answers, toks = await answer_request(readout, body)

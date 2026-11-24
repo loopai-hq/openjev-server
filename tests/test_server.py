@@ -1,3 +1,6 @@
+import gzip
+import json
+
 from fastapi.testclient import TestClient
 
 from openjev_server.profile import Profile
@@ -54,6 +57,16 @@ def test_version_health_metrics_prewarm(fake_backend):
     m = c.get("/metrics").text
     assert "openjev_requests_total" in m and "openjev_request_seconds" in m
     assert c.post("/v1/prewarm", json={"state": REQ["state"]}).json()["ok"] is True
+
+
+def test_prewarm_checks_the_token_before_it_reads_the_body(fake_backend):
+    """/v1/prewarm reads its body as /v1/systemone does: after the bearer check, capped at 32 MiB, compressed bodies too."""
+    c = client(fake_backend, token="secret")
+    json_type, auth = {"Content-Type": "application/json"}, {"Content-Type": "application/json", "Authorization": "Bearer secret"}
+    assert c.post("/v1/prewarm", content=b'{"state": ', headers=json_type).status_code == 401
+    assert c.post("/v1/prewarm", content=b'{"state": "' + b"a" * (32 * 1024 * 1024) + b'"}', headers=auth).status_code == 413
+    r = c.post("/v1/prewarm", content=gzip.compress(json.dumps({"state": REQ["state"]}).encode()), headers={**auth, "Content-Encoding": "gzip"})
+    assert r.status_code == 200 and r.json()["ok"] is True
 
 
 def test_read_twice_is_reported_and_its_fallbacks_counted(fake_backend):
