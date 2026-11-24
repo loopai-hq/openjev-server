@@ -1,9 +1,10 @@
 import asyncio
+import threading
 
 import pytest
 
 from openjev_server.profile import Profile
-from openjev_server.readout import BadQuestion, Readout, choice_confidence, compose_chunks, score_confidence, softmax
+from openjev_server.readout import TOKEN_CHARS_MAX, BadQuestion, Readout, choice_confidence, compose_chunks, score_confidence, softmax
 
 
 def test_confidence_formulas():
@@ -48,6 +49,39 @@ def test_stagger_runs_first_question_alone(fake_backend):
     ro = Readout(fake_backend, Profile(stagger=True, stagger_min_chars=10))
     ans, toks = asyncio.run(ro.answer_all("x" * 100, {"a": {"type": "noul", "instructions": "yes?"}, "b": {"type": "noul", "instructions": "no?"}}))
     assert set(ans) == {"a", "b"} and toks > 0 and 0 <= ans["a"]["noul"] <= 1
+
+
+def test_read_twice_counts_tokens_off_the_event_loop(fake_backend, monkeypatch):
+    """With a known window, the doubled prompt is counted in a worker thread: a long state must not stall every other request."""
+    threads = []
+    count = fake_backend.header_tokens
+    monkeypatch.setattr(fake_backend, "header_tokens", lambda text: threads.append(threading.get_ident()) or count(text))
+    fake_backend.window = 16384
+
+    async def answer():
+        await Readout(fake_backend, Profile(repeat=True)).answer_all("short state", {"q": {"type": "noul", "instructions": "ok?"}})
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(answer())
+    assert threads and loop_thread not in threads
+
+
+@pytest.mark.parametrize("window", [0, 100])
+def test_read_twice_sends_a_prompt_too_long_for_any_count_once(fake_backend, monkeypatch, window):
+    """More characters than the window times the longest token cannot fit: such a prompt goes out once, counted, never tokenized."""
+
+    def count(text):
+        raise AssertionError("tokenized")
+
+    monkeypatch.setattr(fake_backend, "header_tokens", count)
+    fake_backend.window = window
+    ans, _ = asyncio.run(Readout(fake_backend, Profile(repeat=True)).answer_all("x" * (window * 128), {"q": {"type": "noul", "instructions": "ok?"}}))
+    assert ans["q"]["read_once"] == 1 and [p.count("\nQuestion: ") for p in fake_backend.prompts] == [1]
+
+
+def test_no_token_is_longer_than_the_read_twice_bound(fake_backend):
+    tok = fake_backend.tok
+    assert max(len(t) for t in tok.convert_ids_to_tokens(list(range(len(tok))))) <= TOKEN_CHARS_MAX
 
 
 def test_noul_calibration_direction(fake_backend):

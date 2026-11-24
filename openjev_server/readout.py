@@ -1,7 +1,7 @@
 """The one-pass readout: letter scores -> calibrated probabilities -> answers (choice / score / noul).
 
 The calibration math, the two-stage fallback above 52 options and the confidence formulas are the ones of OpenJev's released helper
-(helper/shim.py, sha 81a22f1b), and read twice is the one of OpenJev 1.1's helper (sha 0f04305c): with the same profile constants
+(helper/shim.py, sha 81a22f1b), and read twice is the one of OpenJev 1.1's helper (sha f35b7272): with the same profile constants
 this module produces the same answers, and tests/test_compat.py holds that equality on fixtures.
 """
 
@@ -20,6 +20,7 @@ from .profile import Profile
 from .prompt import State, build_prompt, make_state, prefix_text
 
 MAX_ONE_PASS = len(LETTERS)
+TOKEN_CHARS_MAX = 128  # characters in the longest token of OpenJev's vocabulary: a prompt with more per window token cannot fit
 # The hosted API lets a question leave out its instructions; these neutral ones stand in. Answers in that shape are not measured.
 DEFAULT_INSTRUCTIONS = {"choice": "Which option is correct?", "score": "Rate the content above.", "noul": "Is the statement true?"}
 
@@ -88,7 +89,7 @@ class Readout:
         allowed = [ids[LETTERS[i]] for i in range(len(options))]
         if len(set(allowed)) != len(allowed):
             raise ReadoutIncomplete("candidate token ids are not unique for this tokenizer")
-        content, once = self._read_twice(build_prompt(state_text, instructions, options, self.profile, self.backend))
+        content, once = await self._read_twice(build_prompt(state_text, instructions, options, self.profile, self.backend))
         raw, tokens = await self.backend.logprobs(content, allowed)
         if len(raw) != len(allowed) or any(v is None or not math.isfinite(v) for v in raw):
             n = sum(1 for v in raw if v is None or not math.isfinite(v))
@@ -97,14 +98,17 @@ class Readout:
         self.stats["prompt_tokens"] += tokens
         return softmax([v / self.profile.temp for v in raw]), Usage(tokens, once)
 
-    def _read_twice(self, content: str | list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]], int]:
+    async def _read_twice(self, content: str | list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]], int]:
         """`profile.repeat`: a text prompt, a blank line, then the same prompt again, when that plus the read's one output token fits the
-        backend's window (or the window is unknown); else the prompt once, counted. Screenshot prompts are always read once."""
+        backend's window (or the backend has none); else the prompt once, counted. Screenshot prompts are always read once. The tokens
+        are counted in a worker thread, so a long state does not stall other requests, and not at all when the text is too long."""
         if not self.profile.repeat or not isinstance(content, str):
             return content, 0
         twice = f"{content}\n\n{content}"
         window = self.backend.window
-        if window is None or self.backend.header_tokens(twice) + 1 <= window:
+        if window is None:
+            return twice, 0
+        if len(twice) <= window * TOKEN_CHARS_MAX and await asyncio.to_thread(self.backend.header_tokens, twice) + 1 <= window:
             return twice, 0
         return content, 1
 

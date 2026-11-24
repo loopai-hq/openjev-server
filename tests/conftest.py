@@ -17,21 +17,21 @@ def _tokenizer_dir():
         return None
 
 
-def _shim_path(env, repo):
+def _shim_path(env, repo, revision=None):
     """The path in `env` when set, else helper/shim.py from the model repo `repo`; None when neither is reachable."""
     if os.environ.get(env):
         return os.environ[env]
     try:
         from huggingface_hub import hf_hub_download
 
-        return hf_hub_download(repo, "helper/shim.py")
+        return hf_hub_download(repo, "helper/shim.py", revision=revision)
     except (OSError, ValueError):  # no network, no Hub access
         return None
 
 
 TOKENIZER = _tokenizer_dir()
 SHIM = _shim_path("OPENJEV_TEST_SHIM", "openjev/openjev")
-SHIM_1_1 = _shim_path("OPENJEV_TEST_SHIM_1_1", "openjev/OpenJev-1.1")
+SHIM_1_1 = _shim_path("OPENJEV_TEST_SHIM_1_1", "openjev/OpenJev-1.1", "6b45f458b1985dfbb9edde764efdf9d9e4afc6d3")  # pinned: the repo is re-published
 
 
 def fake_scores(content, token_ids):
@@ -147,6 +147,6 @@ def shim(tokenizer_path):
 
 @pytest.fixture(scope="session")
 def shim_1_1(tokenizer_path):
-    """OpenJev 1.1's helper (shim.py 0f04305c: v1's plus read twice), loaded the same way. Read twice stays off until a test sets its
+    """OpenJev 1.1's helper (shim.py f35b7272: v1's plus read twice), loaded the same way. Read twice stays off until a test sets its
     REPEAT."""
-    return load_helper(SHIM_1_1, "0f04305c")
+    return load_helper(SHIM_1_1, "f35b7272")
