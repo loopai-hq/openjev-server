@@ -7,7 +7,11 @@
 - Requests written for the hosted Jev API (Jev 1.14) on `POST /v1/systemone`, in the new `body.py`: gzip, x-gzip and zstd bodies (415 for other encodings), 32 MiB per body as sent and after decompression (413), one image through `assets` (base64 or multipart), optional `instructions` with a neutral default, one-level scores answered without the model, the requested `model` echoed, and `GET /v1/models`.
 - Bounded work per request body: a multipart body is split on its boundary without a line parser and holds at most two parts (the JSON and one image), each with at most 8 KiB of headers; a compressed body is one gzip member or one zstd frame (window up to 32 MiB), inflated in steps of at most 1 MiB, and a truncated one is a 400; JSON nested too deeply for the parser is a 400.
 - Every error is JSON with this server's `error` object and the hosted API's `detail`. Malformed JSON and non-object bodies are 400 (they were 422).
-- Requests that 0.2.0 accepted send the same prompts, byte for byte: a new regression test holds them to the released helper's. `tests/test_compat.py` also holds read twice to OpenJev 1.1's helper.
+- Only JSON (`application/json`, `application/*+json`) and `multipart/form-data` bodies are read; anything else is a 415, as it was refused (422) by 0.2.0. Set `--token` whenever a browser can reach the port.
+- `/v1/prewarm` reads its body like `/v1/systemone`: after the bearer check, capped at 32 MiB (FastAPI parsed it whole before the check).
+- Requests that 0.2.0 answered send the same prompts, byte for byte, with two exceptions: a body over 32 MiB is now a 413, and a request with an `assets` field, which 0.2.0 ignored, now sends its image or is a 400. A new regression test holds the prompts to the released helper's; `tests/test_compat.py` also holds read twice to OpenJev 1.1's helper.
+- Read twice counts tokens in a worker thread, and not at all for a doubled prompt with more than 128 characters per window token, which cannot fit. A named model whose backend has no `GET /v1/models` starts again, with window 0 (every prompt read once).
+- Multipart part headers go through the compat32 header parser, which hostile headers do not crash.
 - New dependency: `zstandard` (the standard library reads zstd only from Python 3.14).
 
 ## 0.2.0 (2026-09-22)

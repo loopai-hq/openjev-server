@@ -17,7 +17,7 @@ It is the server behind [OpenJev](https://huggingface.co/openjev), an open 27B d
 - **Read twice.** `--repeat` writes each text prompt twice in one request. Off by default. See [Read twice](#read-twice).
 - **Requests written for the hosted Jev API (Jev 1.14):** gzip and zstd bodies, one image through `assets`, optional `instructions`, one-level scores, `GET /v1/models`, the requested `model` echoed and JSON errors with `detail`. See [Jev API compatibility](#jev-api-compatibility).
 
-Requests that 0.2.0 accepted send the model the same prompts, byte for byte. The full list is in the [changelog](CHANGELOG.md).
+Requests that 0.2.0 answered send the model the same prompts, byte for byte, except where 0.3.0 reads them differently: a body over 32 MiB is now refused (413), and a request with an `assets` field, which 0.2.0 ignored, now sends its image to the model, or is a 400 when the field is not one image. The full list is in the [changelog](CHANGELOG.md).
 
 ## What you get
 
@@ -186,7 +186,8 @@ print(answers["route"]["choice"], answers["route"]["probabilities"], answers["an
 
 `--repeat` (or `"repeat": true` in a profile, or the helper's `READOUT_REPEAT=1`) writes each text prompt twice in one request: state, question and options, a blank line, then all of it again. The answer is still read at the first output position, now after the second copy. Weights and calibration stay the same. Screenshot prompts are read once.
 
-- A read whose doubled prompt would not fit the model server's window goes out once, and its answer says how many reads did: `"read_once": 1`. `openjev_read_once_total` on `/metrics` adds them up. The window is the `max_model_len` that vLLM reports (its `--max-model-len`, shown as `window` in the startup probe), so on a server started with a longer window this server doubles prompts up to it, where the 1.1 helper stops at 16,384 tokens. A backend that reports no window, and the MLX backend, always get both copies.
+- A read whose doubled prompt would not fit the model server's window goes out once, and its answer says how many reads did: `"read_once": 1`. `openjev_read_once_total` on `/metrics` adds them up. The window is the `max_model_len` that vLLM reports (its `--max-model-len`, shown as `window` in the startup probe), so on a server started with a longer window this server doubles prompts up to it, where the 1.1 helper stops at 16,384 tokens. A backend that reports no window, and the MLX backend, always get both copies. When `GET /v1/models` fails on a backend whose model is named with `--served-model-name`, the window counts as 0: every prompt goes out once and is counted.
+- The doubled prompt's tokens are counted in a worker thread, and not at all when it has more than 128 characters per window token (no token of OpenJev's vocabulary is longer), since it cannot fit.
 - On the MLX backend, doubled prompts are read whole for every question: the reuse of a request's shared part does not apply to them.
 - The [OpenJev 1.1 card](https://huggingface.co/openjev/OpenJev-1.1#read-twice) measured what read twice changes on that model, and what it costs: 2.6 to 3.3 times the GPU time. Those runs used the model's own helper, which sends the same prompts as this server (`tests/test_compat.py`); this server's own speed with read twice is not measured.
 - `GET /v1/version` shows it as `flags.repeat`.
@@ -205,6 +206,7 @@ print(answers["route"]["choice"], answers["route"]["probabilities"], answers["an
 | one image through `assets`, base64 in the JSON or a multipart body | supported; it takes the same path as `state.image`. A multipart body holds the JSON and at most one image part, each with at most 8 KiB of part headers. Not measured on the model |
 | several images, or images in `instructions` or `criteria` | not supported (400) |
 | `box` questions | not supported (422) |
+| JSON and multipart/form-data bodies | supported; any other Content-Type is a 415 |
 | gzip and zstd request bodies | supported, one layer: one gzip member or one zstd frame (window up to 32 MiB) |
 | request body up to 32 MiB | supported; 413 above, also after decompression |
 | `GET /v1/models` | supported; `release_date` is the day the server started |
@@ -247,7 +249,7 @@ openjev serve --backend vllm --model your/model --profile profiles/your-model.js
 |---|---|
 | liveness, readiness, metrics | `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus) |
 | what is running | `GET /v1/version`: model, profile, probe, hash of the readout code |
-| auth | `--token` requires `Authorization: Bearer` on `/v1/*` |
+| auth | `--token` requires `Authorization: Bearer` on `/v1/*`. Set one whenever a browser can reach the port: any web page can send a multipart/form-data request to it |
 | long states | `POST /v1/prewarm` prefills a state before its questions arrive |
 | accuracy modes | `--perms 4` averages each answer over four option orders; `--repeat` [reads each text prompt twice](#read-twice). Both cost latency |
 | benchmark | `openjev bench --endpoint http://localhost:3000 --tokens 1400 --conc 32` |
