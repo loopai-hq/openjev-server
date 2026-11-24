@@ -15,6 +15,7 @@
 - Read twice counts tokens in a worker thread, and not at all for a doubled prompt with more than 128 characters per window token, which cannot fit. A named model whose backend has no `GET /v1/models` starts again, with window 0 (every prompt read once).
 - Multipart part headers go through the compat32 header parser, which hostile headers do not crash.
 - New dependency: `zstandard` (the standard library reads zstd only from Python 3.14).
+- Demos: the source names in `demos/out/recorded_gpu/colocated-browser-provenance.json` are neutral (`jev_ultrafast/…`, `workflow_demo/…`, `run.py`); their hashes and the rest of the recording are unchanged.
 
 ## 0.2.0 (2026-09-22)
 - Modules by job: `profile.py` (calibration constants), `prompt.py` (state text and prompt layouts), `readout.py` (scores to answers), `backends/base.py` (the backend contract), `backends/make_backend` (the only place that knows backend names). Answers unchanged: the compat tests against the released helper still hold.
