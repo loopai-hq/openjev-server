@@ -1,6 +1,6 @@
 [project]
 name = "openjev-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "A decision API (POST /v1/systemone) over any open language model: one forward pass, a probability for every option."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -13,6 +13,7 @@ dependencies = [
   "pydantic-settings>=2.3",
   "prometheus-client>=0.20",
   "transformers>=4.57",
+  "zstandard>=0.23",  # zstd request bodies (the hosted API's SDKs use zstd where it is available); the standard library reads zstd only from Python 3.14
 ]
 
 [project.optional-dependencies]

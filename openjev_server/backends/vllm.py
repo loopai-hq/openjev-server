@@ -55,6 +55,7 @@ class VllmBackend:
         self.base_url = base_url.rstrip("/")
         self.options = options
         self.model = options.model
+        self.window: int | None = None  # read by start()
         self.exact = options.exact
         self.assistant_prefix = options.assistant_prefix
         self._client = httpx.AsyncClient(
@@ -72,14 +73,14 @@ class VllmBackend:
     # ---- contract
 
     async def start(self) -> dict:
-        """Discover the served model name and whether the server supports the exact readout. Returns what it found."""
+        """Discover the served model name, its context window and whether the server supports the exact readout. Returns what it found."""
+        cards = await self._model_cards()
         if self.model is None:
-            r = await self._client.get("/models")
-            r.raise_for_status()
-            models = [m["id"] for m in r.json().get("data", [])]
-            if not models:
+            if not cards:
                 raise BackendError("the backend lists no models")
-            self.model = models[0]
+            self.model = next(iter(cards))
+        # vLLM's GET /models reports its --max-model-len. Without that route the window is unknown, taken as 0: read twice reads once
+        self.window = 0 if cards is None else cards.get(self.model, {}).get("max_model_len")
         if self.exact is None:
             ids = list(self._ids.values())[:3]
             try:
@@ -87,7 +88,26 @@ class VllmBackend:
                 self.exact = all(f"token_id:{i}" in top for i in ids)
             except (BackendError, KeyError, IndexError, TypeError):
                 self.exact = False
-        return {"served_model": self.model, "exact_readout": self.exact, "chat_template": self.chat, "letter_prefix": self.letter_prefix, "vision": self.vision}
+        return {
+            "served_model": self.model,
+            "exact_readout": self.exact,
+            "chat_template": self.chat,
+            "letter_prefix": self.letter_prefix,
+            "vision": self.vision,
+            "window": self.window,
+        }
+
+    async def _model_cards(self) -> dict[str, dict] | None:
+        """GET /models as {id: card}. When the served model is named, a backend without the route still starts (0.2.0 never asked):
+        then None."""
+        try:
+            r = await self._client.get("/models")
+            r.raise_for_status()
+            return {m["id"]: m for m in r.json().get("data", [])}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+            if self.model is None:
+                raise
+            return None
 
     def letter_ids(self) -> dict[str, int]:
         return self._ids

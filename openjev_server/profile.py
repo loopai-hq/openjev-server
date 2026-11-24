@@ -25,6 +25,7 @@ class Profile:
     pad: int = 0  # >0 pads the shared prefix to a multiple of this many tokens (cache-block alignment)
     letter_prefix: str = "auto"  # which single-token form the labels use: "" (bare "A"), " " (space-prefixed), or auto (bare if the tokenizer has it)
     assistant_prefix: str = ""  # text placed at the start of the assistant turn before the readout position (e.g. an empty think block for reasoning models)
+    repeat: bool = False  # read twice: each text prompt twice in one request, a blank line between the copies; once when that would not fit the window
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Profile:

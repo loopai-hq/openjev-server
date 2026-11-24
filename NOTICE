@@ -2,5 +2,7 @@ openjev-server
 Copyright 2026 the OpenJev contributors
 
 Licensed under the Apache License, Version 2.0. The readout prompt layouts, calibration and confidence formulas
-descend from the helper published with the OpenJev model (huggingface.co/openjev/openjev, helper/shim.py, Apache 2.0).
+descend from the helper published with the OpenJev model (huggingface.co/openjev/openjev, helper/shim.py, Apache 2.0); read twice
+and the hosted-API request handling descend from OpenJev 1.1's helper (huggingface.co/openjev/OpenJev-1.1, helper/shim.py and
+helper/compat.py, Apache 2.0).
 The confidence formulas follow TypeSafe's published adapter (system-one-adapter-python, confidence_metrics.py).

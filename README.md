@@ -3,13 +3,21 @@
 One-pass decisions from any open language model, served as an API.
 
 [![ci](https://img.shields.io/github/actions/workflow/status/abhishekgahlot2/openjev-server/ci.yml?label=CI)](https://github.com/abhishekgahlot2/openjev-server/actions/workflows/ci.yml)
-[![weights](https://img.shields.io/badge/weights-16bit%20%7C%20FP8%20%7C%20MLX-blue)](https://huggingface.co/openjev)
+[![weights](https://img.shields.io/badge/weights-16bit%20%7C%20FP8%20%7C%20FP4%20%7C%20MLX-blue)](https://huggingface.co/openjev)
 [![space](https://img.shields.io/badge/Hugging%20Face-Space-yellow)](https://huggingface.co/spaces/openjev/openjev-server)
 [![licence](https://img.shields.io/badge/licence-Apache%202.0-green)](LICENSE)
 
 Send a situation and your questions. Get back one choice, a yes/no probability or a score per question, with a probability for every option. The answer is read off the model's first output position: one forward pass per question, nothing generated, no chain of thought to wait for.
 
 It is the server behind [OpenJev](https://huggingface.co/openjev), an open 27B decision model for browser and desktop agents. Point it at OpenJev, or at your own model: anything served by vLLM, or an MLX model on a Mac.
+
+## What's new in 0.3.0
+
+- **OpenJev 1.1** and its **FP4 build** for Blackwell GPUs, in [Models](#models) and the [quick start](#quick-start). 1.1 keeps v1's calibration, so it runs on the `openjev` profile.
+- **Read twice.** `--repeat` writes each text prompt twice in one request. Off by default. See [Read twice](#read-twice).
+- **Requests written for the hosted Jev API (Jev 1.14):** gzip and zstd bodies, one image through `assets`, optional `instructions`, one-level scores, `GET /v1/models`, the requested `model` echoed and JSON errors with `detail`. See [Jev API compatibility](#jev-api-compatibility).
+
+Requests that 0.2.0 answered send the model the same prompts, byte for byte, except where 0.3.0 reads them differently: a body over 32 MiB is now refused (413), and a request with an `assets` field, which 0.2.0 ignored, now sends its image to the model, or is a 400 when the field is not one image. The full list is in the [changelog](CHANGELOG.md).
 
 ## What you get
 
@@ -18,7 +26,8 @@ It is the server behind [OpenJev](https://huggingface.co/openjev), an open 27B d
 - **Any model.** A startup probe finds the label tokens, checks for exact score readout and vision, and refuses to serve a model that would return noise.
 - **Honest probabilities for your model.** `openjev calibrate` fits the two calibration constants on your own development rows.
 - **Fast where it matters.** Exact candidate scores by token id on vLLM. On a Mac the shared part of a request is read once and reused for every question.
-- **Drop-in for clients of the hosted API.** Request and response shapes follow Jev's `/v1/systemone`, so a client written for it can point at your server.
+- **Drop-in for clients of the hosted API.** Request and response shapes follow Jev's `/v1/systemone` (Jev 1.14), so a client written for it can point at your server. What works and what does not is [listed below](#jev-api-compatibility).
+- **Read twice when accuracy matters more than speed.** `--repeat` sends each text prompt twice in one request.
 - **Built to run.** Health and readiness, Prometheus metrics, bearer auth, a bench command, Docker Compose, CI.
 
 ## Why OpenJev
@@ -63,12 +72,14 @@ Real runs, every decision logged. The scripts ran on a MacBook Pro with the 4-bi
 
 | build | runs on | link |
 |---|---|---|
-| OpenJev 16 bit | two 80 GB GPUs, or one with offload | [openjev/openjev](https://huggingface.co/openjev/openjev) |
-| OpenJev FP8 | one H100 or any 80 GB GPU | [openjev/openjev-FP8](https://huggingface.co/openjev/openjev-FP8) |
-| OpenJev MLX 8 bit | Apple silicon, 64 GB | [openjev/openjev-MLX](https://huggingface.co/openjev/openjev-MLX) |
-| OpenJev MLX 4 bit | Apple silicon, 32 GB | [openjev/openjev-MLX-4bit](https://huggingface.co/openjev/openjev-MLX-4bit) |
+| OpenJev 1.1, 16 bit | one 80 GB GPU such as the H100, quantized to 8 bit when vLLM loads it (`--quantization fp8`) | [openjev/OpenJev-1.1](https://huggingface.co/openjev/OpenJev-1.1) |
+| OpenJev 1.1 FP4 | Blackwell GPUs such as the B200 (NVFP4 and FP8 in one checkpoint, no quantization flag) | [openjev/OpenJev-1.1-FP4](https://huggingface.co/openjev/OpenJev-1.1-FP4) |
+| OpenJev v1, 16 bit | two 80 GB GPUs, or one with offload | [openjev/openjev](https://huggingface.co/openjev/openjev) |
+| OpenJev v1 FP8 | one H100 or any 80 GB GPU | [openjev/openjev-FP8](https://huggingface.co/openjev/openjev-FP8) |
+| OpenJev v1 MLX 8 bit | Apple silicon, 64 GB | [openjev/openjev-MLX](https://huggingface.co/openjev/openjev-MLX) |
+| OpenJev v1 MLX 4 bit | Apple silicon, 32 GB | [openjev/openjev-MLX-4bit](https://huggingface.co/openjev/openjev-MLX-4bit) |
 
-Accuracy, calibration and latency numbers are on the model cards and the [org page](https://huggingface.co/openjev).
+There is no MLX build of 1.1: on a Mac, use a v1 MLX build. Accuracy, calibration and latency numbers are on the model cards and the [org page](https://huggingface.co/openjev).
 
 ## Install
 
@@ -78,17 +89,31 @@ pip install "openjev-server @ git+https://github.com/abhishekgahlot2/openjev-ser
 
 ## Quick start
 
-**One GPU, vLLM**
+**One 80 GB GPU (H100), vLLM: OpenJev 1.1**
 
 ```bash
-vllm serve openjev/openjev-FP8 --served-model-name qwen --port 8000 --enable-prefix-caching \
-  --max-model-len 16384 --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{"image":1}' \
-  --trust-remote-code --max-num-seqs 64 --max-logprobs 64 --gdn-prefill-backend triton --quantization fp8
+vllm serve openjev/OpenJev-1.1 --host 127.0.0.1 --served-model-name qwen --port 8000 \
+  --enable-prefix-caching --max-model-len 16384 --gpu-memory-utilization 0.90 \
+  --limit-mm-per-prompt '{"image":1}' --trust-remote-code --max-num-seqs 256 \
+  --max-logprobs 64 --gdn-prefill-backend triton --quantization fp8
 
-openjev serve --backend vllm --model openjev/openjev-FP8 --vllm-url http://localhost:8000/v1 --profile openjev --port 3000
+openjev serve --backend vllm --model openjev/OpenJev-1.1 --vllm-url http://localhost:8000/v1 --profile openjev --port 3000
 ```
 
-**Mac, MLX**
+**Blackwell GPU (B200), vLLM: OpenJev 1.1 FP4**
+
+```bash
+vllm serve openjev/OpenJev-1.1-FP4 --host 127.0.0.1 --served-model-name qwen --port 8000 \
+  --enable-prefix-caching --max-model-len 16384 --gpu-memory-utilization 0.90 \
+  --limit-mm-per-prompt '{"image":1}' --trust-remote-code --max-num-seqs 256 \
+  --max-logprobs 64 --gdn-prefill-backend triton
+
+openjev serve --backend vllm --model openjev/OpenJev-1.1-FP4 --vllm-url http://localhost:8000/v1 --profile openjev --port 3000
+```
+
+No `--quantization` flag for FP4: the checkpoint is already quantized and vLLM refuses the flag on it. Both 1.1 builds use v1's calibration, the `openjev` profile. Add `--repeat` to the `openjev serve` line to [read twice](#read-twice). These are the vLLM settings of the 1.1 model cards; this server was not itself run on 1.1 for this release (its prompts are the helper's, see [below](#same-answers-as-the-published-helper)). For OpenJev v1, serve `openjev/openjev-FP8` with the same flags and pass it as `--model`.
+
+**Mac, MLX (OpenJev v1)**
 
 ```bash
 pip install "openjev-server[mlx] @ git+https://github.com/abhishekgahlot2/openjev-server"
@@ -154,8 +179,42 @@ print(answers["route"]["choice"], answers["route"]["probabilities"], answers["an
 
 - `instructions` may be a string or an object, for example a goal plus rules.
 - Up to 52 options answer in one pass. More are handled in two passes.
-- A screenshot goes in `state.screenshot` as a data URL, on models with a vision tower.
+- A screenshot goes in `state.screenshot` as a data URL, on models with a vision tower, or [through `assets`](#jev-api-compatibility) as on the hosted API.
 - Request and response shapes follow the hosted Jev API. A client written for it can be pointed at your own server.
+
+## Read twice
+
+`--repeat` (or `"repeat": true` in a profile, or the helper's `READOUT_REPEAT=1`) writes each text prompt twice in one request: state, question and options, a blank line, then all of it again. The answer is still read at the first output position, now after the second copy. Weights and calibration stay the same. Screenshot prompts are read once.
+
+- A read whose doubled prompt would not fit the model server's window goes out once, and its answer says how many reads did: `"read_once": 1`. `openjev_read_once_total` on `/metrics` adds them up. The window is the `max_model_len` that vLLM reports (its `--max-model-len`, shown as `window` in the startup probe), so on a server started with a longer window this server doubles prompts up to it, where the 1.1 helper stops at 16,384 tokens. A backend that reports no window, and the MLX backend, always get both copies. When `GET /v1/models` fails on a backend whose model is named with `--served-model-name`, the window counts as 0: every prompt goes out once and is counted.
+- The doubled prompt's tokens are counted in a worker thread, and not at all when it has more than 128 characters per window token (no token of OpenJev's vocabulary is longer), since it cannot fit.
+- On the MLX backend, doubled prompts are read whole for every question: the reuse of a request's shared part does not apply to them.
+- The [OpenJev 1.1 card](https://huggingface.co/openjev/OpenJev-1.1#read-twice) measured what read twice changes on that model, and what it costs: 2.6 to 3.3 times the GPU time. Those runs used the model's own helper, which sends the same prompts as this server (`tests/test_compat.py`); this server's own speed with read twice is not measured.
+- `GET /v1/version` shows it as `flags.repeat`.
+
+## Jev API compatibility
+
+`POST /v1/systemone` takes requests written for the hosted Jev API (Jev 1.14).
+
+| hosted Jev API feature | openjev-server |
+|---|---|
+| `choice`, `score` and `noul` questions, several per request | supported |
+| a `score` with one level | supported; answered without the model, all probability on that level |
+| `instructions` left out | supported; a neutral default instruction is used. Answers in this shape are not measured |
+| `state` as text, object or array | supported; an array is sent to the model as JSON text |
+| one image in `state` | supported, on models with a vision tower |
+| one image through `assets`, base64 in the JSON or a multipart body | supported; it takes the same path as `state.image`. A multipart body holds the JSON and at most one image part, each with at most 8 KiB of part headers. Not measured on the model |
+| several images, or images in `instructions` or `criteria` | not supported (400) |
+| `box` questions | not supported (422) |
+| JSON and multipart/form-data bodies | supported; any other Content-Type is a 415 |
+| gzip and zstd request bodies | supported, one layer: one gzip member or one zstd frame (window up to 32 MiB) |
+| request body up to 32 MiB | supported; 413 above, also after decompression |
+| `GET /v1/models` | supported; `release_date` is the day the server started |
+| JSON errors with `detail` | supported, next to this server's `error` object |
+| the answer's `model` echoes the requested model | supported |
+| bearer token | supported (`--token`) |
+
+An image sent through `assets` must be the whole `state` or one whole top-level value of an object `state`, used once, as PNG or JPEG. A prompt carries one image, placed before its text (vLLM runs with one image per prompt), so anything else is refused rather than guessed at.
 
 ## Any model
 
@@ -190,9 +249,9 @@ openjev serve --backend vllm --model your/model --profile profiles/your-model.js
 |---|---|
 | liveness, readiness, metrics | `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus) |
 | what is running | `GET /v1/version`: model, profile, probe, hash of the readout code |
-| auth | `--token` requires `Authorization: Bearer` on `/v1/*` |
+| auth | `--token` requires `Authorization: Bearer` on `/v1/*`. Without a token, a request that a browser marks `Sec-Fetch-Site: cross-site` is refused (403); browsers that send no such header and pages on the same site are not stopped by that, so set a token whenever a browser can reach the port |
 | long states | `POST /v1/prewarm` prefills a state before its questions arrive |
-| accuracy mode | `--perms 4` averages each answer over four option orders, at higher latency |
+| accuracy modes | `--perms 4` averages each answer over four option orders; `--repeat` [reads each text prompt twice](#read-twice). Both cost latency |
 | benchmark | `openjev bench --endpoint http://localhost:3000 --tokens 1400 --conc 32` |
 | settings | CLI flags, then `OPENJEV_*` variables, then the profile file. The original helper's `READOUT_*` names still work |
 | containers | `Dockerfile` and `docker-compose.yml` for one GPU |
@@ -201,13 +260,16 @@ openjev serve --backend vllm --model your/model --profile profiles/your-model.js
 
 With the `openjev` profile this server produces the same answers as the helper shipped in the model repository (`helper/shim.py`). The prompt layouts, calibration and confidence formulas are the same code paths, held by `tests/test_compat.py` and checked on the real model.
 
+With `--repeat` it sends the same prompts and gives the same answers as OpenJev 1.1's helper with `READOUT_REPEAT=1`, including which reads fall back to one copy at the window's edge, on a model server with the helper's 16,384-token window. The same tests hold that with a stand-in model; this path was not run on the real model by this server.
+
 ## Layout
 
 | module | job |
 |---|---|
 | `openjev_server/profile.py` | the constants that turn scores into answers |
 | `openjev_server/prompt.py` | state text and prompt layouts, byte-identical to the released helper |
-| `openjev_server/readout.py` | scores to calibrated probabilities to answers; two-stage fallback above 52 options |
+| `openjev_server/readout.py` | scores to calibrated probabilities to answers; two-stage fallback above 52 options; read twice |
+| `openjev_server/body.py` | request bodies the way the hosted API's clients send them: compression, the 32 MiB limit, one image through `assets` |
 | `openjev_server/backends/base.py` | the contract: log-probabilities of given token ids at the first output position |
 | `openjev_server/backends/vllm.py`, `mlx.py` | the two backends; `make_backend` builds one from settings |
 | `openjev_server/backends/letters.py`, `probe.py` | label tokens for any tokenizer; the startup check |
@@ -222,7 +284,7 @@ ruff check openjev_server tests && ruff format --check openjev_server tests
 pytest -q tests
 ```
 
-The tests fetch the public OpenJev tokenizer and the released helper from the Hub. `python scripts/publish_space.py` mirrors the repository to the Hugging Face Space (needs `HF_TOKEN` in the environment).
+The tests fetch the public OpenJev tokenizer and the released helpers (v1 and 1.1) from the Hub. `python scripts/publish_space.py` mirrors the repository to the Hugging Face Space (needs `HF_TOKEN` in the environment).
 
 ## Licence
 

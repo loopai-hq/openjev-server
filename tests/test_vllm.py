@@ -90,3 +90,36 @@ def test_start_discovers_model_and_exact_support(tokenizer_path):
     b.model = None
     found = asyncio.run(b.start())
     assert found["served_model"] == "served-name" and found["exact_readout"] is True and found["letter_prefix"] == b.letter_prefix
+
+
+def test_start_reads_the_window_of_the_served_model(tokenizer_path):
+    """The read-twice window is the served model's max_model_len from GET /models (vLLM's --max-model-len); None when not reported."""
+
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "other", "max_model_len": 4096}, {"id": "m", "max_model_len": 65536}, {"id": "bare"}]})
+        body = json.loads(request.content)
+        return chat_response([{"token": f"token_id:{i}", "logprob": -1.0} for i in body["logprob_token_ids"]])
+
+    for name, window in (("m", 65536), ("bare", None)):
+        b = make_backend(tokenizer_path, handler)
+        b.model = name
+        assert asyncio.run(b.start())["window"] == window and b.window == window
+
+
+def test_start_with_a_named_model_survives_a_backend_without_models(tokenizer_path):
+    """With --served-model-name, 0.2.0 never asked GET /models: a backend without that route still starts. Its window is unknown and
+    taken as 0, so read twice sends every prompt once and counts it. Without a name, GET /models is still required."""
+
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(404, text="not here")
+        body = json.loads(request.content)
+        return chat_response([{"token": f"token_id:{i}", "logprob": -1.0} for i in body["logprob_token_ids"]])
+
+    b = make_backend(tokenizer_path, handler)
+    found = asyncio.run(b.start())
+    assert found["served_model"] == "m" and found["window"] == 0 and found["exact_readout"] is True
+    b.model = None
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(b.start())

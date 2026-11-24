@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import os
 
@@ -16,20 +17,21 @@ def _tokenizer_dir():
         return None
 
 
-def _shim_path():
-    """OPENJEV_TEST_SHIM, else the released helper/shim.py from the OpenJev model repo; None when neither is reachable."""
-    if os.environ.get("OPENJEV_TEST_SHIM"):
-        return os.environ["OPENJEV_TEST_SHIM"]
+def _shim_path(env, repo, revision=None):
+    """The path in `env` when set, else helper/shim.py from the model repo `repo`; None when neither is reachable."""
+    if os.environ.get(env):
+        return os.environ[env]
     try:
         from huggingface_hub import hf_hub_download
 
-        return hf_hub_download("openjev/openjev", "helper/shim.py")
+        return hf_hub_download(repo, "helper/shim.py", revision=revision)
     except (OSError, ValueError):  # no network, no Hub access
         return None
 
 
 TOKENIZER = _tokenizer_dir()
-SHIM = _shim_path()
+SHIM = _shim_path("OPENJEV_TEST_SHIM", "openjev/openjev")
+SHIM_1_1 = _shim_path("OPENJEV_TEST_SHIM_1_1", "openjev/OpenJev-1.1", "6b45f458b1985dfbb9edde764efdf9d9e4afc6d3")  # pinned: the repo is re-published
 
 
 def fake_scores(content, token_ids):
@@ -42,19 +44,26 @@ def fake_scores(content, token_ids):
     return out
 
 
+@functools.cache
+def shared_tokenizer():
+    """The test tokenizer, loaded once for the session: tests only read it."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(TOKENIZER)
+
+
 class FakeBackend:
     """Answers the readout's one question from fake_scores; records every prompt it saw."""
 
     def __init__(self):
-        from transformers import AutoTokenizer
-
         from openjev_server.backends.letters import header_counter, letter_ids
 
-        self.tok = AutoTokenizer.from_pretrained(TOKENIZER)
+        self.tok = shared_tokenizer()
         self._ids, self.letter_prefix = letter_ids(self.tok)
         self._header = header_counter(self.tok)
         self.prompts = []
         self.vision = True
+        self.window = None
 
     def letter_ids(self):
         return self._ids
@@ -88,11 +97,13 @@ def fake_backend(tokenizer_path):
     return FakeBackend()
 
 
-@pytest.fixture(scope="session")
-def shim(tokenizer_path):
-    """The released helper (shim.py 81a22f1b), imported with the published profile and its model client replaced by fake_scores."""
-    if not SHIM or not os.path.exists(SHIM):
-        pytest.skip("released shim.py not available (set OPENJEV_TEST_SHIM or allow Hub downloads)")
+def load_helper(path, sha):
+    """A released helper, checked against its published sha256 prefix, imported with the published profile and its model client
+    replaced by fake_scores."""
+    if not path or not os.path.exists(path):
+        pytest.skip(f"released helper {sha} not available (set OPENJEV_TEST_SHIM / OPENJEV_TEST_SHIM_1_1 or allow Hub downloads)")
+    with open(path, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest().startswith(sha), f"{path} is not the published helper {sha}"
     import importlib.util
     import types
 
@@ -107,7 +118,7 @@ def shim(tokenizer_path):
         "READOUT_PERMS": os.environ.get("SHIM_TEST_PERMS", "1"),
     }.items():
         os.environ[k] = v
-    spec = importlib.util.spec_from_file_location("released_shim", SHIM)
+    spec = importlib.util.spec_from_file_location(f"released_shim_{sha}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     seen = []
@@ -126,3 +137,16 @@ def shim(tokenizer_path):
     mod.client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)), base_url="fake://")
     mod._seen_prompts = seen
     return mod
+
+
+@pytest.fixture(scope="session")
+def shim(tokenizer_path):
+    """The released helper (shim.py 81a22f1b), imported with the published profile and its model client replaced by fake_scores."""
+    return load_helper(SHIM, "81a22f1b")
+
+
+@pytest.fixture(scope="session")
+def shim_1_1(tokenizer_path):
+    """OpenJev 1.1's helper (shim.py f35b7272: v1's plus read twice), loaded the same way. Read twice stays off until a test sets its
+    REPEAT."""
+    return load_helper(SHIM_1_1, "f35b7272")
