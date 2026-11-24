@@ -105,3 +105,21 @@ def test_start_reads_the_window_of_the_served_model(tokenizer_path):
         b = make_backend(tokenizer_path, handler)
         b.model = name
         assert asyncio.run(b.start())["window"] == window and b.window == window
+
+
+def test_start_with_a_named_model_survives_a_backend_without_models(tokenizer_path):
+    """With --served-model-name, 0.2.0 never asked GET /models: a backend without that route still starts. Its window is unknown and
+    taken as 0, so read twice sends every prompt once and counts it. Without a name, GET /models is still required."""
+
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(404, text="not here")
+        body = json.loads(request.content)
+        return chat_response([{"token": f"token_id:{i}", "logprob": -1.0} for i in body["logprob_token_ids"]])
+
+    b = make_backend(tokenizer_path, handler)
+    found = asyncio.run(b.start())
+    assert found["served_model"] == "m" and found["window"] == 0 and found["exact_readout"] is True
+    b.model = None
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(b.start())

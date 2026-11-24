@@ -11,7 +11,9 @@ class BackendError(RuntimeError):
 
 
 class Backend(Protocol):
-    window: int | None  # the model server's context window in tokens (prompt plus output); None when it does not say
+    # The model server's context window in tokens (prompt plus output), for read twice. None: it has or reports none, so both copies
+    # always go; 0: it could not be asked, so every prompt goes once.
+    window: int | None
 
     async def start(self) -> dict:
         """Connect / load and report what was found (served model, exact readout, chat template, letter prefix, vision)."""
