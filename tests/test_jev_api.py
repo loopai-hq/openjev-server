@@ -262,6 +262,27 @@ def test_a_multipart_body_holds_at_most_two_parts(fake_backend, monkeypatch):
     assert r.status_code == 400 and "at most one image" in r.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "disposition", [b"form-data; name=" + b"(" * 500, b'a;n*\ra=-t;c"a*b*pi\x00Dn'], ids=["parentheses-500-deep", "broken-rfc2231-parameter"]
+)
+def test_hostile_part_headers_are_400(fake_backend, disposition):
+    """Part headers that crash the email package's modern header parser (RecursionError, IndexError) are a JSON 400."""
+    b = "9f2c41d0b7e84a6c"
+    raw = f"--{b}\r\nContent-Disposition: ".encode() + disposition + b"\r\n\r\n" + json.dumps(REQ).encode() + f"\r\n--{b}--\r\n".encode()
+    r = api(fake_backend).post("/v1/systemone", content=raw, headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+    assert r.status_code == 400 and r.json()["error"]["code"] == 400
+
+
+@pytest.mark.parametrize(
+    ("content_type", "status"),
+    [(None, 415), ("text/plain", 415), ("application/x-www-form-urlencoded", 415), ("application/json; charset=utf-8", 200), ("application/vnd.api+json", 200)],
+)
+def test_only_json_or_multipart_bodies_are_read(fake_backend, content_type, status):
+    """A web page may send text/plain or form bodies to any server it reaches without asking first: only JSON or multipart is read."""
+    r = api(fake_backend).post("/v1/systemone", content=json.dumps(REQ).encode(), headers={} if content_type is None else {"Content-Type": content_type})
+    assert r.status_code == status and (status == 200 or "Content-Type" in r.json()["detail"])
+
+
 @pytest.mark.parametrize(("size", "status"), [(8 * 1024, 200), (8 * 1024 + 1, 400)])
 def test_a_multipart_part_has_at_most_8_kib_of_headers(fake_backend, size, status):
     prefix = 'Content-Disposition: form-data; name="asset-0"; filename="asset-0"\r\nContent-Type: image/png\r\nX-Pad: '

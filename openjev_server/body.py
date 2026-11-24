@@ -1,13 +1,14 @@
-"""Request bodies the way clients of the hosted Jev API send them: one compression layer (gzip or zstd), at most 32 MiB as sent and
-after decompression, and one image through `assets`, as base64 in the JSON or as a part of a multipart/form-data body. Each step is
-linear in the body's size and bounded in memory, so a small body cannot make the server inflate, allocate or parse much more."""
+"""Request bodies the way clients of the hosted Jev API send them: JSON or multipart/form-data, one compression layer (gzip or zstd),
+at most 32 MiB as sent and after decompression, and one image through `assets`, as base64 in the JSON or as a part of a multipart
+body. Inflating stops one byte past the limit, a zstd frame may not ask for a larger window, and a multipart body is split without a
+line parser. A body within the limit is still parsed in full, and parsed JSON can take far more memory than its size: 31 MiB of
+[{},{},...] is 11 million objects, about 700 MiB."""
 
 from __future__ import annotations
 
 import base64
 import email.message
 import email.parser
-import email.policy
 import io
 import json
 import zlib
@@ -32,11 +33,16 @@ class BadBody(ValueError):
 
 
 async def read_body(request: Request) -> dict[str, Any]:
-    """The request's JSON object, decoded the way the hosted API's clients send it; an image sent through `assets` becomes state.image."""
-    data = inflate(await read_capped(request), request.headers.get("content-encoding"))
+    """The request's JSON object, decoded the way the hosted API's clients send it; an image sent through `assets` becomes state.image.
+    Only JSON and multipart/form-data bodies are read: a web page can send text/plain or form bodies to any server it can reach."""
     content_type = request.headers.get("content-type", "")
+    media_type = content_type.split(";")[0].strip().lower()
+    kind, _, subtype = media_type.partition("/")
+    if media_type != "multipart/form-data" and not (kind == "application" and (subtype == "json" or subtype.endswith("+json"))):
+        raise BadBody(415, f"unsupported Content-Type {content_type!r}: send application/json, or multipart/form-data with one image")
+    data = inflate(await read_capped(request), request.headers.get("content-encoding"))
     files: dict[str, bytes] = {}
-    if content_type.split(";")[0].strip().lower() == "multipart/form-data":
+    if media_type == "multipart/form-data":
         data, files = split_multipart(data, content_type)
     body = parse_object(data)
     if files or "assets" in body:
@@ -137,8 +143,9 @@ def read_part(piece: bytes) -> tuple[str | None, bytes]:
     end = piece.find(b"\r\n\r\n", 0, 2 + MAX_PART_HEADERS + 4)  # the blank line after the header block
     if not piece.startswith(b"\r\n") or end < 0 or not piece.endswith(b"\r\n"):
         raise BadBody(400, f"a multipart part is a line break, at most {MAX_PART_HEADERS} bytes of headers, a blank line, its content and a line break")
-    headers = email.parser.BytesHeaderParser(policy=email.policy.HTTP).parsebytes(piece[2:end])
-    return headers.get_param("name", header="content-disposition"), piece[end + 4 : -2]
+    headers = email.parser.BytesHeaderParser().parsebytes(piece[2:end])  # compat32: the modern parser crashes on hostile headers
+    name = headers.get_param("name", header="content-disposition")
+    return name if isinstance(name, str) else None, piece[end + 4 : -2]
 
 
 def parse_object(data: bytes) -> dict[str, Any]:
