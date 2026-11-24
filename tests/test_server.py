@@ -1,8 +1,11 @@
 import gzip
+import hashlib
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from openjev_server import server
 from openjev_server.profile import Profile
 from openjev_server.readout import Readout
 from openjev_server.server import build_app
@@ -38,6 +41,38 @@ def test_auth(fake_backend):
     assert c.get("/v1/version").status_code == 401
     assert c.post("/v1/systemone", json=REQ, headers={"Authorization": "Bearer secret"}).status_code == 200
     assert c.get("/healthz").status_code == 200  # never behind auth
+
+
+def test_cross_site_browser_requests_need_a_token(fake_backend, monkeypatch):
+    """Without --token a web page could make a visitor's browser post work here (multipart/form-data needs no CORS preflight).
+    Browsers mark such requests Sec-Fetch-Site: cross-site; every /v1 route refuses them with 403 before any body is read."""
+
+    async def unread(request):
+        raise AssertionError("the body was read")
+
+    monkeypatch.setattr(server, "read_body", unread)
+    c = client(fake_backend)
+    cross = {"Sec-Fetch-Site": "cross-site", "Content-Type": "multipart/form-data; boundary=x"}
+    for method, path in (("POST", "/v1/systemone"), ("POST", "/v1/prewarm"), ("GET", "/v1/version"), ("GET", "/v1/models")):
+        r = c.request(method, path, content=b"--x\r\n" if method == "POST" else None, headers=cross)
+        assert r.status_code == 403 and r.json()["error"]["code"] == 403, (path, r.status_code)
+
+
+def test_same_origin_calls_and_tokens_are_unchanged(fake_backend):
+    """Same-origin pages, clients that send no Sec-Fetch-Site (SDKs, curl), and cross-site calls with a valid token are served."""
+    c = client(fake_backend)
+    assert c.post("/v1/systemone", json=REQ, headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+    assert c.post("/v1/systemone", json=REQ).status_code == 200
+    t = client(fake_backend, token="secret")
+    assert t.post("/v1/systemone", json=REQ, headers={"Sec-Fetch-Site": "cross-site", "Authorization": "Bearer secret"}).status_code == 200
+    assert t.post("/v1/systemone", json=REQ, headers={"Sec-Fetch-Site": "cross-site"}).status_code == 401
+
+
+def test_readout_hash_covers_the_code_that_writes_the_state(fake_backend):
+    """readout_sha256 covers prompt.py, readout.py and body.py, which moves an image from `assets` into the state the model reads."""
+    here = Path(server.__file__).parent
+    want = hashlib.sha256(b"".join((here / m).read_bytes() for m in ("prompt.py", "readout.py", "body.py"))).hexdigest()
+    assert client(fake_backend).get("/v1/version").json()["readout_sha256"] == want
 
 
 def test_validation(fake_backend):

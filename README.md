@@ -249,7 +249,7 @@ openjev serve --backend vllm --model your/model --profile profiles/your-model.js
 |---|---|
 | liveness, readiness, metrics | `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus) |
 | what is running | `GET /v1/version`: model, profile, probe, hash of the readout code |
-| auth | `--token` requires `Authorization: Bearer` on `/v1/*`. Set one whenever a browser can reach the port: any web page can send a multipart/form-data request to it |
+| auth | `--token` requires `Authorization: Bearer` on `/v1/*`. Without a token, a request that a browser marks `Sec-Fetch-Site: cross-site` is refused (403); browsers that send no such header and pages on the same site are not stopped by that, so set a token whenever a browser can reach the port |
 | long states | `POST /v1/prewarm` prefills a state before its questions arrive |
 | accuracy modes | `--perms 4` averages each answer over four option orders; `--repeat` [reads each text prompt twice](#read-twice). Both cost latency |
 | benchmark | `openjev bench --endpoint http://localhost:3000 --tokens 1400 --conc 32` |

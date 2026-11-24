@@ -9,6 +9,8 @@
 - Every error is JSON with this server's `error` object and the hosted API's `detail`. Malformed JSON and non-object bodies are 400 (they were 422).
 - Only JSON (`application/json`, `application/*+json`) and `multipart/form-data` bodies are read; anything else is a 415, as it was refused (422) by 0.2.0. Set `--token` whenever a browser can reach the port.
 - `/v1/prewarm` reads its body like `/v1/systemone`: after the bearer check, capped at 32 MiB (FastAPI parsed it whole before the check).
+- Without `--token`, every `/v1` route refuses a request that a browser marks `Sec-Fetch-Site: cross-site` (403): a multipart/form-data post needs no CORS preflight, so a web page could otherwise make a visitor's browser post work to the server. SDKs and curl send no such header; with a token the rule does not apply.
+- `/v1/version.readout_sha256` also hashes `body.py`, which writes an image from `assets` into the state the model reads.
 - Requests that 0.2.0 answered send the same prompts, byte for byte, with two exceptions: a body over 32 MiB is now a 413, and a request with an `assets` field, which 0.2.0 ignored, now sends its image or is a 400. A new regression test holds the prompts to the released helper's; `tests/test_compat.py` also holds read twice to OpenJev 1.1's helper.
 - Read twice counts tokens in a worker thread, and not at all for a doubled prompt with more than 128 characters per window token, which cannot fit. A named model whose backend has no `GET /v1/models` starts again, with window 0 (every prompt read once).
 - Multipart part headers go through the compat32 header parser, which hostile headers do not crash.

@@ -35,7 +35,7 @@ LAT = Histogram("openjev_request_seconds", "systemone request latency", buckets=
 INFLIGHT = Gauge("openjev_inflight_requests", "requests in flight")
 READ_ONCE = Counter("openjev_read_once_total", "reads sent once because their doubled prompt (read twice) would not fit the window")
 
-ANSWER_MODULES = ("prompt.py", "readout.py")  # the code that determines answers; its hash is reported by /v1/version
+ANSWER_MODULES = ("prompt.py", "readout.py", "body.py")  # the code that shapes what the model reads and the answers; hashed in /v1/version
 
 
 class Question(BaseModel):
@@ -116,14 +116,19 @@ def version_info(readout: Readout, *, backend_name: str, model_dir: str, extra: 
     }
 
 
-def bearer_auth(token: str):
-    """A dependency that requires `Authorization: Bearer <token>` when a token is configured (no token: open)."""
+def access_check(token: str):
+    """The dependency guarding /v1/*. With a token configured, `Authorization: Bearer <token>` is required. Without one, a request
+    that a browser marks cross-site is refused: a web page could otherwise make a visitor's browser post work here, as a
+    multipart/form-data post needs no CORS preflight. SDKs and curl send no Sec-Fetch-Site header."""
 
-    async def auth(request: Request):
-        if token and request.headers.get("Authorization", "") != f"Bearer {token}":
-            raise http_error(401, "missing or invalid bearer token")
+    async def check(request: Request):
+        if token:
+            if request.headers.get("Authorization", "") != f"Bearer {token}":
+                raise http_error(401, "missing or invalid bearer token")
+        elif request.headers.get("Sec-Fetch-Site") == "cross-site":
+            raise http_error(403, "cross-site requests from a browser need a server started with --token")
 
-    return auth
+    return check
 
 
 def ops_router(readout: Readout, backend_name: str) -> APIRouter:
@@ -148,7 +153,7 @@ def ops_router(readout: Readout, backend_name: str) -> APIRouter:
 
 def api_router(readout: Readout, version: dict, model_string: str, token: str) -> APIRouter:
     """The /v1 API: version, models, prewarm, systemone, chat passthrough."""
-    r = APIRouter(prefix="/v1", dependencies=[Depends(bearer_auth(token))])
+    r = APIRouter(prefix="/v1", dependencies=[Depends(access_check(token))])
     started = time.strftime("%Y-%m-%d", time.gmtime())
 
     @r.get("/version")
